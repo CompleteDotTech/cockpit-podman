@@ -43,6 +43,10 @@ assert.equal(latestFailed.status, healthStates.unhealthy);
 assert.equal(latestFailed.reason, "latest-check-failed");
 assert.equal(latestFailed.latestExitCode, -1);
 assert.equal(latestFailed.rawStatus, "healthy");
+assert.equal(healthAssessment(fixtures["latest-failed"].container, now, null, {
+    coverage_status: "error",
+    collector_errors: ["collector failed"],
+}).status, healthStates.unhealthy);
 
 for (const malformedExitCode of [null, "", false]) {
     const malformed = structuredClone(fixtures["latest-failed"].container);
