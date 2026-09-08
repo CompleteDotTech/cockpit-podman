@@ -103,33 +103,179 @@ await initialLoad;
 assert.equal(initialLoaded, true);
 assert.equal(initialRuns, 2);
 
+// Event detail requests are keyed by full owner/container identity. A newer
+// event for B must discard only B's older inspect while an in-flight A inspect
+// remains applicable. The production path uses a separate owner gate for
+// scheduler coverage, so scheduler invalidation cannot drop container detail.
+const eventDetailGate = new SchedulerRequestGate();
+const detailAKey = "event-guard-owner-a";
+const detailBKey = "event-guard-owner-b";
+const detailA = eventDetailGate.begin(detailAKey);
+const detailBOld = eventDetailGate.begin(detailBKey);
+const detailBNew = eventDetailGate.begin(detailBKey);
+assert.equal(eventDetailGate.isCurrent(detailAKey, detailA), true);
+assert.equal(eventDetailGate.isCurrent(detailBKey, detailBOld), false);
+assert.equal(eventDetailGate.isCurrent(detailBKey, detailBNew), true);
+
+// Health and exec events do not launch scheduler collection, so they must not
+// invalidate an in-flight owner scheduler result with no replacement. A
+// topology event does request a new owner-scoped scheduler generation.
+const schedulerCoverageGate = new SchedulerRequestGate();
+const schedulerOwner = "event-guard-scheduler-owner";
+const schedulerInFlight = schedulerCoverageGate.begin(schedulerOwner);
+assert.equal(schedulerCoverageGate.isCurrent(schedulerOwner, schedulerInFlight), true);
+const topologyRefresh = schedulerCoverageGate.begin(schedulerOwner);
+assert.equal(schedulerCoverageGate.isCurrent(schedulerOwner, schedulerInFlight), false);
+assert.equal(schedulerCoverageGate.isCurrent(schedulerOwner, topologyRefresh), true);
+
 // Health events can arrive continuously while both owner inventories are
-// inspected. They merge through the per-container path and must not cancel
-// the initial owner load; exercise the observed 84/72-row scopes.
+// inspected. Model the actual event path: each event starts a per-container
+// inspect, records its generation/action, and commits only when that event is
+// still current. The initial inventory captures generations before listing,
+// preserves event-updated rows at commit, and merges event-created rows that
+// were absent from the listing. Exercise the observed 84/72-row scopes.
+const sleep = delay => new Promise(resolveResponse => setTimeout(resolveResponse, delay));
 const eventFloodGate = new OwnerRefreshGate(2);
-const eventFloodLoaded = new Set();
-const eventFloodCounts = new Map();
-const eventFloodLoads = [84, 72].map((rowCount, ownerIndex) => {
+const runEventFloodInitialLoad = async (rowCount, ownerIndex) => {
     const uid = `event-flood-${ownerIndex}`;
+    const ids = Array.from({ length: rowCount }, (_, index) =>
+        `${index.toString(16).padStart(2, "0")}${"0".repeat(62)}`);
+    const eventGate = new SchedulerRequestGate();
+    const eventGenerations = new Map();
+    const eventActions = new Map();
+    const pendingEvents = new Map();
+    const state = new Map();
+    const schedulerGate = new SchedulerRequestGate();
+    const initialEventGenerations = new Map(eventGenerations);
+    let eventCount = 0;
+    let loaded = false;
+
+    const emitContainerEvent = (id, action = "health_status") => {
+        const key = `${uid}-${id}`;
+        const request = eventGate.begin(key);
+        eventGenerations.set(key, request.generation);
+        eventActions.set(key, action);
+        const wait = pendingEvents.get(key) || Promise.resolve();
+        const operation = wait.then(async () => {
+            await sleep(1);
+            if (eventGate.isCurrent(key, request))
+                state.set(key, { Id: id, source: "event", generation: request.generation });
+        });
+        pendingEvents.set(key, operation);
+        operation.finally(() => {
+            if (pendingEvents.get(key) === operation)
+                pendingEvents.delete(key);
+        });
+        return operation;
+    };
+
     const entry = eventFloodGate.start(uid, async request => {
-        const rows = Array.from({ length: rowCount }, (_, index) => index);
-        await mapWithConcurrency(rows, async row => {
-            await new Promise(resolveResponse => setTimeout(resolveResponse, 1));
-            return row;
+        // getContainers() resolves before the bounded 8-worker inspect fanout.
+        await sleep(2);
+        const inventory = ids.map(id => ({ Id: id }));
+        const inspected = await mapWithConcurrency(inventory, async row => {
+            await sleep(1);
+            return { ...row, source: "inventory" };
         }, 8);
-        if (eventFloodGate.isCurrent(uid, request))
-            eventFloodLoaded.add(uid);
+        assert.equal(eventFloodGate.isCurrent(uid, request), true);
+
+        const listedKeys = new Set(inspected.map(row => `${uid}-${row.Id}`));
+        const committed = new Map();
+        for (const [key, row] of state) {
+            if (key.startsWith(`${uid}-`) && !listedKeys.has(key)) {
+                const snapshotGeneration = initialEventGenerations.get(key) || 0;
+                const currentGeneration = eventGenerations.get(key) || 0;
+                if (currentGeneration !== snapshotGeneration && eventActions.get(key) !== "remove")
+                    committed.set(key, row);
+            }
+        }
+        for (const row of inspected) {
+            const key = `${uid}-${row.Id}`;
+            const snapshotGeneration = initialEventGenerations.get(key) || 0;
+            const currentGeneration = eventGenerations.get(key) || 0;
+            if (currentGeneration !== snapshotGeneration) {
+                if (eventActions.get(key) === "remove")
+                    continue;
+                const current = state.get(key);
+                if (current) {
+                    committed.set(key, current);
+                    continue;
+                }
+            }
+            committed.set(key, row);
+        }
+        state.clear();
+        for (const [key, row] of committed)
+            state.set(key, row);
+        loaded = true;
+
+        // The scheduler collector runs after the inventory commit. Health
+        // events must not invalidate this owner-scoped result while they
+        // continue through independent per-container detail requests.
+        const schedulerRequest = schedulerGate.begin(uid);
+        await sleep(2);
+        assert.equal(schedulerGate.isCurrent(uid, schedulerRequest), true);
     });
+
+    // This is the health_status stream that previously invalidated the owner
+    // generation on every event. It deliberately never invalidates the owner
+    // gate; only the per-container inspect generation changes.
     const events = setInterval(() => {
-        eventFloodCounts.set(uid, (eventFloodCounts.get(uid) || 0) + 1);
-        // health_status events merge through the per-container inspect path;
-        // they do not invalidate the owner initial generation.
+        const id = ids[eventCount % ids.length];
+        eventCount++;
+        void emitContainerEvent(id);
     }, 1);
-    return entry.promise.finally(() => clearInterval(events));
-});
-await Promise.all(eventFloodLoads);
-assert.deepEqual([...eventFloodLoaded].sort(), ["event-flood-0", "event-flood-1"]);
-assert.ok([...eventFloodCounts.values()].every(count => count > 0));
+    await entry.promise;
+    clearInterval(events);
+    await Promise.all([...pendingEvents.values()]);
+    assert.equal(loaded, true);
+    assert.equal(state.size, rowCount);
+    assert.ok(eventCount > 0);
+    return { state, eventCount };
+};
+
+const eventFloodLoads = await Promise.all([84, 72].map(runEventFloodInitialLoad));
+assert.deepEqual(eventFloodLoads.map(result => result.state.size), [84, 72]);
+assert.ok(eventFloodLoads.every(result => result.eventCount > 0));
+
+// A remove tombstone must win over the stale inventory row, while an event
+// created row absent from that inventory must survive the initial rebuild.
+const mergeGate = new SchedulerRequestGate();
+const mergeOwner = "event-merge-owner";
+const removedId = "a".repeat(64);
+const createdId = "b".repeat(64);
+const removedKey = `${mergeOwner}-${removedId}`;
+const createdKey = `${mergeOwner}-${createdId}`;
+const mergeGenerations = new Map();
+const mergeActions = new Map();
+const mergeState = new Map([[removedKey, { Id: removedId, source: "old" }],
+    [createdKey, { Id: createdId, source: "event" }]]);
+const mergeSnapshot = new Map(mergeGenerations);
+const removedRequest = mergeGate.begin(removedKey);
+mergeGenerations.set(removedKey, removedRequest.generation);
+mergeActions.set(removedKey, "remove");
+const createdRequest = mergeGate.begin(createdKey);
+mergeGenerations.set(createdKey, createdRequest.generation);
+mergeActions.set(createdKey, "create");
+const mergeInventory = [{ Id: removedId }];
+const mergedState = new Map();
+for (const [key, row] of mergeState) {
+    if (mergeInventory.some(container => `${mergeOwner}-${container.Id}` === key))
+        continue;
+    if ((mergeGenerations.get(key) || 0) !== (mergeSnapshot.get(key) || 0) &&
+        mergeActions.get(key) !== "remove")
+        mergedState.set(key, row);
+}
+for (const container of mergeInventory) {
+    const key = `${mergeOwner}-${container.Id}`;
+    if (mergeActions.get(key) === "remove")
+        continue;
+    mergedState.set(key, mergeState.get(key) || container);
+}
+assert.equal(mergeGate.isCurrent(removedKey, removedRequest), true);
+assert.equal(mergeGate.isCurrent(createdKey, createdRequest), true);
+assert.equal(mergedState.has(removedKey), false);
+assert.equal(mergedState.get(createdKey)?.source, "event");
 
 // The timer may enumerate many owner sockets. A per-owner gate alone would
 // still start one inventory and scheduler collector per owner at once; the
