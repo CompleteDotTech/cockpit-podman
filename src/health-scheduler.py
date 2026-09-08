@@ -33,6 +33,8 @@ from typing import Any, Iterable, Mapping, Sequence
 SCHEMA = "train-health-scheduler-coverage/v1"
 DEFAULT_TIMEOUT = 8.0
 DEFAULT_MAX_UNITS = 512
+# The limit applies to stdout and stderr together.  A malicious helper must
+# not bypass the bound by splitting output across the two pipes.
 MAX_OUTPUT_BYTES = 8 * 1024 * 1024
 
 CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -168,6 +170,7 @@ def run_bounded(argv: Sequence[str], timeout: float) -> CommandResult:
 
     selector = selectors.DefaultSelector()
     buffers: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
+    total_output_bytes = 0
     streams = (("stdout", process.stdout), ("stderr", process.stderr))
     for name, stream in streams:
         if stream is not None:
@@ -196,11 +199,12 @@ def run_bounded(argv: Sequence[str], timeout: float) -> CommandResult:
                     stream.close()
                     continue
                 name = key.data
-                if len(buffers[name]) + len(chunk) > MAX_OUTPUT_BYTES:
+                if total_output_bytes + len(chunk) > MAX_OUTPUT_BYTES:
                     overflow = True
                     terminate(process)
                     break
                 buffers[name].extend(chunk)
+                total_output_bytes += len(chunk)
             if timed_out or overflow:
                 break
 
@@ -763,14 +767,22 @@ def collect_coverage(
         if timer is None:
             unattributed.append({"unit": timer_unit, "reason": "timer-metadata-missing"})
             continue
-        if timer.get("ActiveState") != "active":
-            # The list query asked for active units; retaining this guard keeps
-            # a concurrent stop from becoming active coverage.
-            continue
         service_unit = _service_unit(timer, timer_unit)
         service = service_sections.get(service_unit or "")
-        exec_start = _exec_start(service or {})
         potential_health = _looks_like_health_unit(timer_unit, service_unit)
+        if timer.get("ActiveState") != "active" or timer.get("SubState") != "waiting":
+            # The list query asked for active units; retaining this guard keeps
+            # a concurrent stop from becoming active coverage. A timer that is
+            # active but not waiting is elapsed, running, or transitional and
+            # cannot prove that another health check is scheduled.
+            if potential_health:
+                unattributed.append({
+                    "unit": timer_unit,
+                    "service_unit": service_unit,
+                    "reason": "timer-not-waiting",
+                })
+            continue
+        exec_start = _exec_start(service or {})
         if not service:
             if potential_health:
                 unattributed.append({"unit": timer_unit, "service_unit": service_unit, "reason": "service-metadata-missing"})

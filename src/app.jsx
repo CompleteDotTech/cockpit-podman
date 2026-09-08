@@ -40,8 +40,13 @@ const SCHEDULER_STATUSES = new Set(["covered", "covered-with-errors", "uncovered
 const HEALTH_REFRESH_INTERVAL_MS = 15000;
 const HEALTH_REFRESH_TIMEOUT_MS = 15000;
 const HEALTH_INSPECT_TIMEOUT_MS = 5000;
+const HEALTH_EVENT_INSPECT_TIMEOUT_MS = 5000;
 const HEALTH_INSPECT_CONCURRENCY = 8;
 const HEALTH_SCHEDULER_TIMEOUT_MS = 8000;
+
+const isContainerInventoryRow = container => container !== null &&
+    typeof container === "object" && !Array.isArray(container) &&
+    typeof container.Id === "string" && container.Id.trim().length > 0;
 
 // sort order of "users" state for dialogs: system, session user, then other users by ascending name
 function compareUser(a, b) {
@@ -213,7 +218,30 @@ class Application extends React.Component {
         const entry = this.healthRefreshGate.start(con.uid, request => this.collectOwnerHealth(con, request));
         return entry.promise.catch(error => {
             console.warn("periodic health refresh failed", { uid: con.uid, stage: "health-refresh", error: error?.message || "unknown" });
+            this.markOwnerHealthUnavailable(con, entry.request, error);
         });
+    }
+
+    markOwnerHealthUnavailable(con, refreshRequest, error) {
+        if (!this.isCurrentConnection(con) ||
+            (refreshRequest && !this.healthRefreshGate.isCurrent(con.uid, refreshRequest)))
+            return;
+
+        // A failed refresh must invalidate both the context-level health result
+        // and any scheduler result from the previous inventory.  Otherwise a
+        // rejected refresh can leave an old green row visible indefinitely.
+        const schedulerRequest = this.schedulerRequests.begin(con.uid);
+        const reason = errorText(error) || "health collection failed";
+        const containers = Object.values(this.state.containers || {})
+                .filter(container => container.uid === con.uid);
+        this.setState(prevState => {
+            if (!this.isCurrentConnection(con) ||
+                (refreshRequest && !this.healthRefreshGate.isCurrent(con.uid, refreshRequest)))
+                return null;
+            return { contextErrors: { ...prevState.contextErrors, [con.uid]: reason } };
+        });
+        this.applySchedulerCoverage(con, this.schedulerUid(con), containers, null,
+                                    SCHEDULER_FAILURE, schedulerRequest);
     }
 
     async collectOwnerHealth(con, request) {
@@ -229,18 +257,13 @@ class Application extends React.Component {
             if (!Array.isArray(containerList))
                 throw new Error("container inventory is not an array");
         } catch (error) {
-            if (this.isCurrentConnection(con) && this.healthRefreshGate.isCurrent(con.uid, request)) {
-                this.setState(prevState => ({
-                    contextErrors: { ...prevState.contextErrors, [con.uid]: errorText(error) },
-                }));
-                // Invalidate any scheduler response collected for a snapshot
-                // that could not be reconciled with a fresh Podman inventory.
-                this.schedulerRequests.begin(con.uid);
-            }
+            this.markOwnerHealthUnavailable(con, request, error);
             return;
         }
 
         const results = await mapWithConcurrency(containerList, async container => {
+            if (!isContainerInventoryRow(container))
+                return { container, error: new Error("Container inventory row is invalid") };
             const remaining = Math.min(HEALTH_INSPECT_TIMEOUT_MS, refreshDeadline - Date.now());
             if (remaining <= 0)
                 return { container, error: new Error("Container health refresh timed out") };
@@ -257,7 +280,12 @@ class Application extends React.Component {
 
         const snapshot = [];
         const errors = {};
+        let invalidInventoryRow = false;
         for (const result of results) {
+            if (!isContainerInventoryRow(result.container)) {
+                invalidInventoryRow = true;
+                continue;
+            }
             const id = result.container.Id;
             const key = makeKey(con.uid, id);
             if (result.error) {
@@ -298,16 +326,24 @@ class Application extends React.Component {
                     containerErrors[container.key] = errors[container.key];
             });
             const contextErrors = { ...prevState.contextErrors };
-            delete contextErrors[con.uid];
+            if (invalidInventoryRow)
+                contextErrors[con.uid] = "Container inventory row is invalid";
+            else
+                delete contextErrors[con.uid];
             return { containers, containerErrors, contextErrors };
         });
 
         if (!this.isCurrentConnection(con) || !this.healthRefreshGate.isCurrent(con.uid, request))
             return;
         const schedulerRemaining = refreshDeadline - Date.now();
-        if (schedulerRemaining > 0)
-            await this.updateSchedulerCoverage(con, snapshot, null, request,
-                                               Math.min(HEALTH_SCHEDULER_TIMEOUT_MS, schedulerRemaining));
+        if (invalidInventoryRow || schedulerRemaining <= 0) {
+            const schedulerRequest = this.schedulerRequests.begin(con.uid);
+            this.applySchedulerCoverage(con, this.schedulerUid(con), snapshot, null,
+                                        SCHEDULER_FAILURE, schedulerRequest);
+            return;
+        }
+        await this.updateSchedulerCoverage(con, snapshot, null, request,
+                                           Math.min(HEALTH_SCHEDULER_TIMEOUT_MS, schedulerRemaining));
     }
 
     schedulerErrorRecord(con, container, contextUid, reason) {
@@ -477,94 +513,137 @@ class Application extends React.Component {
     }
 
     initContainers(con) {
+        // Initial inventory/inspect/scheduler work uses the same global owner
+        // gate as periodic refreshes.  This prevents startup from launching an
+        // unbounded burst across every discovered Podman context.
         this.healthRefreshGate.invalidate(con.uid);
+        const entry = this.healthRefreshGate.start(con.uid, refreshRequest =>
+            this.collectInitialContainers(con, refreshRequest));
+        return entry.promise.catch(error => {
+            console.warn("initContainers uid", con.uid, "failed:", error?.toString?.() || error);
+            this.markOwnerHealthUnavailable(con, entry.request, error);
+            this.setState(prevState => {
+                if (!this.isCurrentConnection(con) || !this.healthRefreshGate.isCurrent(con.uid, entry.request))
+                    return null;
+                const users = prevState.users.map(u => u.uid === con.uid ? { ...u, containersLoaded: true } : u);
+                return { users };
+            });
+        });
+    }
+
+    async collectInitialContainers(con, refreshRequest) {
         const request = this.schedulerRequests.begin(con.uid);
         const deadline = Date.now() + HEALTH_REFRESH_TIMEOUT_MS;
-        return withTimeout(client.getContainers(con), Math.max(1, deadline - Date.now()),
-                           "Initial container inventory timed out")
-                .then(containerList => {
-                    if (!Array.isArray(containerList))
-                        throw new Error("container inventory is not an array");
-                    return mapWithConcurrency(containerList, async container => {
-                        const remaining = Math.min(HEALTH_INSPECT_TIMEOUT_MS, deadline - Date.now());
-                        if (remaining <= 0)
-                            return { container, error: new Error("Initial container inspect timed out") };
-                        try {
-                            const detail = await withTimeout(client.inspectContainer(con, container.Id), remaining,
-                                                             "Initial container inspect timed out");
-                            return { container, detail };
-                        } catch (error) {
-                            return { container, error };
-                        }
-                    }, HEALTH_INSPECT_CONCURRENCY);
-                })
-                .then(results => {
-                    if (!this.isCurrentConnection(con) || !this.schedulerRequests.isCurrent(con.uid, request))
-                        return;
-                    const schedulerContainers = results.map(result => result.detail || result.container);
-                    this.setState(prevState => {
-                        if (!this.isCurrentConnection(con) || !this.schedulerRequests.isCurrent(con.uid, request))
-                            return null;
-                        // keep/copy the containers of other users
-                        const copyContainers = {};
-                        const copyContainerErrors = {};
-                        Object.entries(prevState.containers || {}).forEach(([id, container]) => {
-                            if (container.uid !== con.uid) {
-                                copyContainers[id] = container;
-                                if (prevState.containerErrors?.[id])
-                                    copyContainerErrors[id] = prevState.containerErrors[id];
-                            }
-                        });
-                        for (const result of results) {
-                            const id = result.container.Id;
-                            const key = makeKey(con.uid, id);
-                            if (result.error) {
-                                // Keep a row when possible so the owner and
-                                // full ID remain visible while inspect is down.
-                                const old = prevState.containers?.[key];
-                                const detail = old || {
-                                    ...result.container,
-                                    Id: id,
-                                    Name: result.container.Names?.[0]?.replace(/^\//, "") || id,
-                                    ImageName: result.container.ImageName || result.container.Image,
-                                    Config: result.container.Config || {},
-                                    State: { Status: String(result.container.State || "").toLowerCase() },
-                                    uid: con.uid,
-                                    key,
-                                };
-                                copyContainers[key] = detail;
-                                copyContainerErrors[key] = errorText(result.error);
-                                continue;
-                            }
+        try {
+            const containerList = await withTimeout(client.getContainers(con), Math.max(1, deadline - Date.now()),
+                                                     "Initial container inventory timed out");
+            if (!Array.isArray(containerList))
+                throw new Error("container inventory is not an array");
+            const results = await mapWithConcurrency(containerList, async container => {
+                if (!isContainerInventoryRow(container))
+                    return { container, error: new Error("Container inventory row is invalid") };
+                const remaining = Math.min(HEALTH_INSPECT_TIMEOUT_MS, deadline - Date.now());
+                if (remaining <= 0)
+                    return { container, error: new Error("Initial container inspect timed out") };
+                try {
+                    const detail = await withTimeout(client.inspectContainer(con, container.Id), remaining,
+                                                     "Initial container inspect timed out");
+                    return { container, detail };
+                } catch (error) {
+                    return { container, error };
+                }
+            }, HEALTH_INSPECT_CONCURRENCY);
+            if (!this.isCurrentConnection(con) ||
+                !this.healthRefreshGate.isCurrent(con.uid, refreshRequest) ||
+                !this.schedulerRequests.isCurrent(con.uid, request))
+                return;
 
-                            const detail = result.detail;
-                            detail.uid = con.uid;
-                            detail.key = key;
-                            copyContainers[key] = detail;
-                        }
-
-                        const users = prevState.users.map(u => u.uid === con.uid ? { ...u, containersLoaded: true } : u);
-                        const contextErrors = { ...prevState.contextErrors };
-                        delete contextErrors[con.uid];
-                        return { containers: copyContainers, containerErrors: copyContainerErrors, contextErrors, users };
-                    });
-                    this.updateContainerStats(con);
-                    this.updateSchedulerCoverage(con, schedulerContainers, request);
-                })
-                .catch(e => {
-                    if (!this.isCurrentConnection(con) || !this.schedulerRequests.isCurrent(con.uid, request))
-                        return;
-                    console.warn("initContainers uid", con.uid, "getContainers failed:", e.toString());
-                    this.setState(prevState => {
-                        const users = prevState.users.map(u => u.uid === con.uid ? { ...u, containersLoaded: true } : u);
-                        return {
-                            containers: prevState.containers || {},
-                            contextErrors: { ...prevState.contextErrors, [con.uid]: errorText(e) },
-                            users,
-                        };
-                    });
-                    this.applySchedulerCoverage(con, this.schedulerUid(con), [], null, errorText(e), request);
+            const validResults = results.filter(result => isContainerInventoryRow(result.container));
+            const invalidInventoryRow = validResults.length !== results.length;
+            const schedulerContainers = validResults.map(result =>
+                isContainerInventoryRow(result.detail) ? result.detail : result.container);
+            this.setState(prevState => {
+                if (!this.isCurrentConnection(con) ||
+                    !this.healthRefreshGate.isCurrent(con.uid, refreshRequest) ||
+                    !this.schedulerRequests.isCurrent(con.uid, request))
+                    return null;
+                // keep/copy the containers of other users
+                const copyContainers = {};
+                const copyContainerErrors = {};
+                Object.entries(prevState.containers || {}).forEach(([id, container]) => {
+                    if (container.uid !== con.uid) {
+                        copyContainers[id] = container;
+                        if (prevState.containerErrors?.[id])
+                            copyContainerErrors[id] = prevState.containerErrors[id];
+                    }
                 });
+                for (const result of validResults) {
+                    const id = result.container.Id;
+                    const key = makeKey(con.uid, id);
+                    const invalidDetail = !result.error && !isContainerInventoryRow(result.detail);
+                    if (result.error || invalidDetail) {
+                        // Keep a row when possible so the owner and full ID
+                        // remain visible while inspect is down or malformed.
+                        const old = prevState.containers?.[key];
+                        const detail = old || {
+                            ...result.container,
+                            Id: id,
+                            Name: result.container.Names?.[0]?.replace(/^\//, "") || id,
+                            ImageName: result.container.ImageName || result.container.Image,
+                            Config: result.container.Config || {},
+                            State: { Status: String(result.container.State || "").toLowerCase() },
+                            uid: con.uid,
+                            key,
+                        };
+                        copyContainers[key] = detail;
+                        copyContainerErrors[key] = errorText(result.error ||
+                                                             new Error("Container inspect returned an invalid object"));
+                        continue;
+                    }
+
+                    const detail = result.detail;
+                    detail.uid = con.uid;
+                    detail.key = key;
+                    copyContainers[key] = detail;
+                }
+
+                const users = prevState.users.map(u => u.uid === con.uid ? { ...u, containersLoaded: true } : u);
+                const contextErrors = { ...prevState.contextErrors };
+                if (invalidInventoryRow)
+                    contextErrors[con.uid] = "Container inventory row is invalid";
+                else
+                    delete contextErrors[con.uid];
+                return { containers: copyContainers, containerErrors: copyContainerErrors, contextErrors, users };
+            });
+            this.updateContainerStats(con);
+            if (invalidInventoryRow || Date.now() >= deadline) {
+                const schedulerRequest = this.schedulerRequests.begin(con.uid);
+                this.applySchedulerCoverage(con, this.schedulerUid(con), schedulerContainers, null,
+                                            SCHEDULER_FAILURE, schedulerRequest);
+                return;
+            }
+            await this.updateSchedulerCoverage(con, schedulerContainers, request, refreshRequest,
+                                               Math.min(HEALTH_SCHEDULER_TIMEOUT_MS, deadline - Date.now()));
+        } catch (error) {
+            if (!this.isCurrentConnection(con) ||
+                !this.healthRefreshGate.isCurrent(con.uid, refreshRequest) ||
+                !this.schedulerRequests.isCurrent(con.uid, request))
+                return;
+            console.warn("initContainers uid", con.uid, "getContainers failed:", error?.toString?.() || error);
+            this.setState(prevState => {
+                if (!this.isCurrentConnection(con) ||
+                    !this.healthRefreshGate.isCurrent(con.uid, refreshRequest) ||
+                    !this.schedulerRequests.isCurrent(con.uid, request))
+                    return null;
+                const users = prevState.users.map(u => u.uid === con.uid ? { ...u, containersLoaded: true } : u);
+                return {
+                    containers: prevState.containers || {},
+                    contextErrors: { ...prevState.contextErrors, [con.uid]: errorText(error) },
+                    users,
+                };
+            });
+            this.applySchedulerCoverage(con, this.schedulerUid(con), [], null, SCHEDULER_FAILURE, request);
+        }
     }
 
     updateImages(con) {
@@ -632,7 +711,9 @@ class Application extends React.Component {
         const key = makeKey(con.uid, id);
         const wait = this.pendingUpdateContainer[key] ?? Promise.resolve();
 
-        const new_wait = wait.then(() => client.inspectContainer(con, id))
+        const new_wait = wait.then(() => withTimeout(client.inspectContainer(con, id),
+                                                     HEALTH_EVENT_INSPECT_TIMEOUT_MS,
+                                                     "Container event inspect timed out"))
                 .then(details => {
                     if (!this.isCurrentConnection(con) || !this.schedulerRequests.isCurrent(con.uid, request))
                         return;
@@ -772,9 +853,9 @@ class Application extends React.Component {
             this.updateContainer(con, id, event);
             break;
 
-        case 'remove':
+        case 'remove': {
             this.healthRefreshGate.invalidate(con.uid);
-            this.schedulerRequests.begin(con.uid);
+            const request = this.schedulerRequests.begin(con.uid);
             this.setState(prevState => {
                 const containers = { ...prevState.containers };
                 delete containers[makeKey(con.uid, id)];
@@ -795,12 +876,19 @@ class Application extends React.Component {
                     pods = prevState.pods;
                     this.updatePods(con);
                 }
-
                 return { containers, containerErrors, schedulerCoverage, pods };
+            }, () => {
+                // Read the post-removal state from the setState callback.  The
+                // old immediate read could feed the deleted container back to
+                // the scheduler and resurrect stale coverage.
+                if (!this.isCurrentConnection(con) || !this.schedulerRequests.isCurrent(con.uid, request))
+                    return;
+                const remaining = Object.values(this.state.containers || {})
+                        .filter(container => container.uid === con.uid && container.Id !== id);
+                this.updateSchedulerCoverage(con, remaining, request);
             });
-            this.updateSchedulerCoverage(con, Object.values(this.state.containers || {})
-                    .filter(container => container.uid === con.uid && container.Id !== id));
             break;
+        }
 
         // only needs to update the Image list, this ought to be an image event
         case 'commit':
