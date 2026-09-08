@@ -33,6 +33,7 @@ export class OwnerRefreshGate extends SchedulerRequestGate {
         super();
         this.running = new Map();
         this.pending = [];
+        this.queued = new Map();
         this.maxConcurrentOwners = Number.isInteger(maxConcurrentOwners) && maxConcurrentOwners > 0
             ? maxConcurrentOwners
             : 1;
@@ -40,9 +41,12 @@ export class OwnerRefreshGate extends SchedulerRequestGate {
 
     start(uid, operation) {
         const key = schedulerOwnerKey(uid);
-        const current = this.running.get(key);
+        const current = this.running.get(key) || this.queued.get(key);
         if (current)
-            return current;
+            if (this.running.has(key) || this.isCurrent(uid, current.request))
+                return current;
+            else
+                this.queued.delete(key);
 
         const request = this.begin(uid);
         let resolveEntry;
@@ -53,6 +57,7 @@ export class OwnerRefreshGate extends SchedulerRequestGate {
         });
         const entry = { key, request, operation, promise, resolve: resolveEntry, reject: rejectEntry };
         this.pending.push(entry);
+        this.queued.set(key, entry);
         this.drain();
         return entry;
     }
@@ -64,6 +69,8 @@ export class OwnerRefreshGate extends SchedulerRequestGate {
     drain() {
         while (this.running.size < this.maxConcurrentOwners && this.pending.length > 0) {
             const entry = this.pending.shift();
+            if (this.queued.get(entry.key) === entry)
+                this.queued.delete(entry.key);
             // A connection can disappear while an owner is waiting for a
             // global slot. Resolve the abandoned request without running its
             // operation; the next connection for this UID gets a new

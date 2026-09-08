@@ -70,6 +70,14 @@ const globalRuns = [1, 2, 3, 4].map(uid => globalGate.start(uid, async () => {
 await Promise.all(globalRuns.map(entry => entry.promise));
 assert.equal(globalMaxActive, 2);
 
+const queuedGate = new OwnerRefreshGate(1);
+const queuedOwner = queuedGate.start("queued-owner", async () => {
+    await new Promise(resolveResponse => setTimeout(resolveResponse, 4));
+});
+const waitingOwner = queuedGate.start("waiting-owner", async () => undefined);
+assert.equal(queuedGate.start("waiting-owner", async () => undefined), waitingOwner);
+await Promise.all([queuedOwner.promise, waitingOwner.promise]);
+
 let activeWorkers = 0;
 let maxWorkers = 0;
 const bounded = await mapWithConcurrency([1, 2, 3, 4, 5], async value => {
