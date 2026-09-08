@@ -44,6 +44,16 @@ assert.equal(latestFailed.reason, "latest-check-failed");
 assert.equal(latestFailed.latestExitCode, -1);
 assert.equal(latestFailed.rawStatus, "healthy");
 
+for (const malformedExitCode of [null, "", false]) {
+    const malformed = structuredClone(fixtures["latest-failed"].container);
+    malformed.State.Health.Log.at(-1).ExitCode = malformedExitCode;
+    const assessment = healthAssessment(malformed, now, null, fixtures["latest-failed"].scheduler);
+    assert.equal(assessment.status, healthStates.unknown, `malformed exit code ${String(malformedExitCode)}`);
+    assert.equal(assessment.reason, "latest-check-unknown");
+    assert.equal(assessment.rawStatus, "healthy");
+    assert.equal(assessment.latestExitCode, null);
+}
+
 const sanitized = healthAssessment(fixtures["collector-error"].container, now, fixtures["collector-error"].error, fixtures["collector-error"].scheduler);
 assert.equal(sanitized.status, healthStates.error);
 assert.equal(sanitized.error, "health-collection-failed");

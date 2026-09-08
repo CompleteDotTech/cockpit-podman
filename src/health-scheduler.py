@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 import json
 import os
 import re
+import selectors
+import signal
 import subprocess
 import sys
 import time
@@ -122,33 +124,110 @@ def _command_error(prefix: str, result: CommandResult) -> str:
 
 
 def run_bounded(argv: Sequence[str], timeout: float) -> CommandResult:
-    """Run one read-only command with a deadline and bounded captured output."""
+    """Run one read-only command with a deadline and bounded pipe reads.
+
+    ``subprocess.run(capture_output=True)`` accumulates arbitrary stdout and
+    stderr before a caller can enforce a limit.  Read both pipes through a
+    selector instead, terminate the process group at the first timeout or
+    overflow, and close every descriptor on every exit path.
+    """
+
+    command = list(argv)
+
+    def terminate(process: subprocess.Popen[bytes]) -> None:
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                # The process group has already been killed. Do not block the
+                # collector forever on a broken child reaper.
+                pass
 
     try:
-        completed = subprocess.run(
-            list(argv),
-            check=False,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=timeout,
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
-        stdout = completed.stdout or ""
-        stderr = completed.stderr or ""
-        # A malicious/faulty helper must not make this collector retain
-        # unbounded output.  systemctl itself is expected to stay well below
-        # this cap with the explicit property/unit limits below.
-        if len(stdout.encode("utf-8", "replace")) > MAX_OUTPUT_BYTES:
-            return CommandResult(list(argv), 75, "", "stdout exceeded collector limit")
-        if len(stderr.encode("utf-8", "replace")) > MAX_OUTPUT_BYTES:
-            stderr = stderr[:MAX_OUTPUT_BYTES]
-        return CommandResult(list(argv), completed.returncode, stdout, stderr)
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        return CommandResult(list(argv), 124, stdout, stderr, timed_out=True)
     except OSError as exc:
-        return CommandResult(list(argv), 127, "", str(exc))
+        return CommandResult(command, 127, "", str(exc))
+
+    selector = selectors.DefaultSelector()
+    buffers: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
+    streams = (("stdout", process.stdout), ("stderr", process.stderr))
+    for name, stream in streams:
+        if stream is not None:
+            selector.register(stream, selectors.EVENT_READ, name)
+
+    timed_out = False
+    overflow = False
+    deadline = time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                terminate(process)
+                break
+            events = selector.select(remaining)
+            if not events:
+                timed_out = True
+                terminate(process)
+                break
+            for key, _ in events:
+                stream = key.fileobj
+                chunk = os.read(stream.fileno(), 64 * 1024)
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                name = key.data
+                if len(buffers[name]) + len(chunk) > MAX_OUTPUT_BYTES:
+                    overflow = True
+                    terminate(process)
+                    break
+                buffers[name].extend(chunk)
+            if timed_out or overflow:
+                break
+
+        if not timed_out and not overflow:
+            returncode = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        else:
+            returncode = 124 if timed_out else 75
+        if timed_out:
+            return CommandResult(command, returncode, "", "", timed_out=True)
+        if overflow:
+            return CommandResult(command, returncode, "", "output exceeded collector limit")
+        return CommandResult(
+            command,
+            returncode,
+            bytes(buffers["stdout"]).decode("utf-8", "replace"),
+            bytes(buffers["stderr"]).decode("utf-8", "replace"),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        terminate(process)
+        return CommandResult(command, 124, "", "", timed_out=True)
+    finally:
+        selector.close()
+        for _, stream in streams:
+            if stream is not None and not stream.closed:
+                stream.close()
+        if process.poll() is None:
+            terminate(process)
 
 
 def parse_systemd_duration(value: str | None) -> float | None:
@@ -444,6 +523,16 @@ def _timer_schedule(properties: Mapping[str, str]) -> tuple[dict[str, Any], list
     if accuracy is None:
         errors.append("missing-accuracy")
 
+    next_realtime = properties.get("NextElapseUSecRealtime", "").strip()
+    next_monotonic = properties.get("NextElapseUSecMonotonic", "").strip()
+    valid_next_realtime = next_realtime if next_realtime.lower() not in {"", "-", "n/a", "na", "infinity", "inf", "0"} else None
+    valid_next_monotonic = next_monotonic if next_monotonic.lower() not in {"", "-", "n/a", "na", "infinity", "inf", "0"} else None
+    if valid_next_realtime is None and valid_next_monotonic is None:
+        # An active unit with no next elapse can be a one-shot or already
+        # elapsed timer. Its configured interval is insufficient evidence of
+        # future health checks, so freshness must remain unavailable.
+        errors.append("missing-next-trigger")
+
     schedule = {
         "effective_interval_seconds": _number(interval),
         "effective_interval_source": interval_source,
@@ -456,8 +545,8 @@ def _timer_schedule(properties: Mapping[str, str]) -> tuple[dict[str, Any], list
         "accuracy_seconds": _number(accuracy),
         "accuracy_source": accuracy_source,
         "last_trigger": properties.get("LastTriggerUSecRealtime") or properties.get("LastTriggerUSec") or None,
-        "next_trigger": properties.get("NextElapseUSecRealtime") or None,
-        "next_trigger_monotonic": properties.get("NextElapseUSecMonotonic") or None,
+        "next_trigger": valid_next_realtime,
+        "next_trigger_monotonic": valid_next_monotonic,
     }
     return schedule, errors
 

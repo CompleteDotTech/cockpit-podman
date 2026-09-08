@@ -29,9 +29,13 @@ export class SchedulerRequestGate {
 // owner advances its generation without cancelling the underlying promise;
 // callers can then discard the late result safely.
 export class OwnerRefreshGate extends SchedulerRequestGate {
-    constructor() {
+    constructor(maxConcurrentOwners = 2) {
         super();
         this.running = new Map();
+        this.pending = [];
+        this.maxConcurrentOwners = Number.isInteger(maxConcurrentOwners) && maxConcurrentOwners > 0
+            ? maxConcurrentOwners
+            : 1;
     }
 
     start(uid, operation) {
@@ -41,29 +45,62 @@ export class OwnerRefreshGate extends SchedulerRequestGate {
             return current;
 
         const request = this.begin(uid);
-        const promise = Promise.resolve()
-                .then(() => operation(request))
-                .finally(() => {
-                    if (this.running.get(key)?.request === request)
-                        this.running.delete(key);
-                });
-        const entry = { key, request, promise };
-        this.running.set(key, entry);
+        let resolveEntry;
+        let rejectEntry;
+        const promise = new Promise((resolve, reject) => {
+            resolveEntry = resolve;
+            rejectEntry = reject;
+        });
+        const entry = { key, request, operation, promise, resolve: resolveEntry, reject: rejectEntry };
+        this.pending.push(entry);
+        this.drain();
         return entry;
     }
 
     invalidate(uid) {
         return this.begin(uid);
     }
+
+    drain() {
+        while (this.running.size < this.maxConcurrentOwners && this.pending.length > 0) {
+            const entry = this.pending.shift();
+            // A connection can disappear while an owner is waiting for a
+            // global slot. Resolve the abandoned request without running its
+            // operation; the next connection for this UID gets a new
+            // generation and cannot be blocked by stale work.
+            if (!this.isCurrent(entry.key, entry.request)) {
+                entry.resolve(undefined);
+                continue;
+            }
+
+            this.running.set(entry.key, entry);
+            Promise.resolve()
+                    .then(() => entry.operation(entry.request))
+                    .then(entry.resolve, entry.reject)
+                    .finally(() => {
+                        if (this.running.get(entry.key)?.request === entry.request)
+                            this.running.delete(entry.key);
+                        this.drain();
+                    });
+        }
+    }
 }
 
-export const withTimeout = (promise, timeoutMs, message) => {
+export const withTimeout = (promise, timeoutMs, message, onTimeout = null) => {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
         return Promise.reject(new Error(message));
 
     let timer;
     const timeout = new Promise((resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+        timer = setTimeout(() => {
+            try {
+                onTimeout?.();
+            } catch {
+                // Timeout cleanup is best effort; the timeout result remains
+                // deterministic even if a bridge channel is already closed.
+            }
+            reject(new Error(message));
+        }, timeoutMs);
     });
     return Promise.race([Promise.resolve(promise), timeout])
             .finally(() => clearTimeout(timer));

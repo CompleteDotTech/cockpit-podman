@@ -90,6 +90,15 @@ export const latestHealthLog = state => {
     }, null)?.log || null;
 };
 
+const healthExitCode = value => {
+    if (typeof value === "number")
+        return Number.isInteger(value) ? value : null;
+    if (typeof value !== "string" || !/^[+-]?\d+$/.test(value.trim()))
+        return null;
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+};
+
 const isTrueMarker = value => value === true ||
     (typeof value === "string" && ["1", "true", "yes"].includes(value.toLowerCase()));
 
@@ -208,8 +217,7 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
     const state = healthState(container);
     const lastChecked = lastHealthCheck(state);
     const latestLog = latestHealthLog(state);
-    const parsedLatestExitCode = latestLog === null ? null : Number(latestLog.ExitCode);
-    const latestExitCode = Number.isFinite(parsedLatestExitCode) ? parsedLatestExitCode : null;
+    const latestExitCode = latestLog === null ? null : healthExitCode(latestLog.ExitCode);
     const ageMs = lastChecked === null ? null : Math.max(0, now - lastChecked);
     const effectiveScheduler = scheduler;
     const freshness = schedulerFreshness(config, effectiveScheduler);
@@ -278,6 +286,13 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
         return base({
             status: healthStates.unhealthy,
             reason: "latest-check-failed",
+        });
+    }
+
+    if (latestLog !== null && latestExitCode === null) {
+        return base({
+            status: healthStates.unknown,
+            reason: "latest-check-unknown",
         });
     }
 

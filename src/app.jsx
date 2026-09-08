@@ -304,8 +304,10 @@ class Application extends React.Component {
 
         if (!this.isCurrentConnection(con) || !this.healthRefreshGate.isCurrent(con.uid, request))
             return;
-        if (Date.now() < refreshDeadline)
-            await this.updateSchedulerCoverage(con, snapshot, null, request);
+        const schedulerRemaining = refreshDeadline - Date.now();
+        if (schedulerRemaining > 0)
+            await this.updateSchedulerCoverage(con, snapshot, null, request,
+                                               Math.min(HEALTH_SCHEDULER_TIMEOUT_MS, schedulerRemaining));
     }
 
     schedulerErrorRecord(con, container, contextUid, reason) {
@@ -394,7 +396,7 @@ class Application extends React.Component {
         return true;
     }
 
-    async updateSchedulerCoverage(con, containers, request = null, refreshRequest = null) {
+    async updateSchedulerCoverage(con, containers, request = null, refreshRequest = null, timeoutMs = HEALTH_SCHEDULER_TIMEOUT_MS) {
         if (!this.isCurrentConnection(con) ||
             (refreshRequest && !this.healthRefreshGate.isCurrent(con.uid, refreshRequest)))
             return;
@@ -418,35 +420,33 @@ class Application extends React.Component {
             environ: ["LC_ALL=C"],
         };
         let process;
-        if (con.uid === null || con.uid === 0) {
-            if (con.uid === 0)
-                options.superuser = "require";
-            process = python.spawn(scheduler_collector,
-                                   ["--uid", String(contextUid), "--timeout", "8"], options);
-        } else {
-            // A numeric --uid alone must never make root's systemctl --user
-            // manager look like another user's manager. Run the helper in the
-            // actual service user's bridge context instead.
-            if (!owner?.name) {
-                this.applySchedulerCoverage(con, contextUid, containers, null, "Service user name is unavailable", request);
-                return;
-            }
-            process = cockpit.spawn([
-                "runuser", "--preserve-environment", "-u", owner.name, "--",
-                "/usr/bin/python3", "-c", scheduler_collector,
-                "--uid", String(contextUid), "--timeout", "8",
-            ], {
-                ...options,
-                superuser: "require",
-                environ: ["LC_ALL=C", `XDG_RUNTIME_DIR=/run/user/${contextUid}`],
-            });
-        }
-
         try {
+            if (con.uid === null || con.uid === 0) {
+                if (con.uid === 0)
+                    options.superuser = "require";
+                process = python.spawn(scheduler_collector,
+                                       ["--uid", String(contextUid), "--timeout", "8"], options);
+            } else {
+                // A numeric --uid alone must never make root's systemctl --user
+                // manager look like another user's manager. Run the helper in
+                // the actual service user's bridge context instead.
+                if (!owner?.name)
+                    throw new Error("Service user name is unavailable");
+                process = cockpit.spawn([
+                    "runuser", "--preserve-environment", "-u", owner.name, "--",
+                    "/usr/bin/python3", "-c", scheduler_collector,
+                    "--uid", String(contextUid), "--timeout", "8",
+                ], {
+                    ...options,
+                    superuser: "require",
+                    environ: ["LC_ALL=C", `XDG_RUNTIME_DIR=/run/user/${contextUid}`],
+                });
+            }
             process.input(JSON.stringify(identity));
             process.input(null);
-            const output = JSON.parse(await withTimeout(process, HEALTH_SCHEDULER_TIMEOUT_MS,
-                                                        "Scheduler coverage collection timed out"));
+            const output = JSON.parse(await withTimeout(process, timeoutMs,
+                                                        "Scheduler coverage collection timed out",
+                                                        () => process?.close?.()));
             if (refreshRequest && !this.healthRefreshGate.isCurrent(con.uid, refreshRequest))
                 return;
             if (output.schema !== SCHEDULER_SCHEMA || output.uid !== contextUid ||
@@ -479,12 +479,25 @@ class Application extends React.Component {
     initContainers(con) {
         this.healthRefreshGate.invalidate(con.uid);
         const request = this.schedulerRequests.begin(con.uid);
-        return client.getContainers(con)
-                .then(containerList => Promise.all(containerList.map(container =>
-                    client.inspectContainer(con, container.Id)
-                            .then(detail => ({ container, detail }))
-                            .catch(error => ({ container, error }))
-                )))
+        const deadline = Date.now() + HEALTH_REFRESH_TIMEOUT_MS;
+        return withTimeout(client.getContainers(con), Math.max(1, deadline - Date.now()),
+                           "Initial container inventory timed out")
+                .then(containerList => {
+                    if (!Array.isArray(containerList))
+                        throw new Error("container inventory is not an array");
+                    return mapWithConcurrency(containerList, async container => {
+                        const remaining = Math.min(HEALTH_INSPECT_TIMEOUT_MS, deadline - Date.now());
+                        if (remaining <= 0)
+                            return { container, error: new Error("Initial container inspect timed out") };
+                        try {
+                            const detail = await withTimeout(client.inspectContainer(con, container.Id), remaining,
+                                                             "Initial container inspect timed out");
+                            return { container, detail };
+                        } catch (error) {
+                            return { container, error };
+                        }
+                    }, HEALTH_INSPECT_CONCURRENCY);
+                })
                 .then(results => {
                     if (!this.isCurrentConnection(con) || !this.schedulerRequests.isCurrent(con.uid, request))
                         return;
@@ -613,7 +626,7 @@ class Application extends React.Component {
         // in flight.  Invalidate that snapshot and let the serialized inspect
         // below become the owner-scoped source of truth.
         this.healthRefreshGate.invalidate(con.uid);
-        this.schedulerRequests.begin(con.uid);
+        const request = this.schedulerRequests.begin(con.uid);
         /* when firing off multiple calls in parallel, podman can return them in a random order.
          * This messes up the state. So we need to serialize them for a particular container. */
         const key = makeKey(con.uid, id);
@@ -621,7 +634,7 @@ class Application extends React.Component {
 
         const new_wait = wait.then(() => client.inspectContainer(con, id))
                 .then(details => {
-                    if (!this.isCurrentConnection(con))
+                    if (!this.isCurrentConnection(con) || !this.schedulerRequests.isCurrent(con.uid, request))
                         return;
                     details.uid = con.uid;
                     details.key = key;
@@ -630,27 +643,25 @@ class Application extends React.Component {
                     if (event?.Action === "restart")
                         details.State.Status = "restarting";
                     this.setState(prevState => {
-                        if (!this.isCurrentConnection(con))
+                        if (!this.isCurrentConnection(con) || !this.schedulerRequests.isCurrent(con.uid, request))
                             return null;
                         const containerErrors = { ...prevState.containerErrors };
                         delete containerErrors[key];
-                        const contextErrors = { ...prevState.contextErrors };
-                        delete contextErrors[con.uid];
                         return {
                             containers: { ...prevState.containers, [key]: details },
                             containerErrors,
-                            contextErrors,
                         };
                     }, () => {
-                        if (["create", "rename", "start"].includes(event?.Action)) {
+                        if (["create", "rename", "start"].includes(event?.Action) &&
+                            this.isCurrentConnection(con) && this.schedulerRequests.isCurrent(con.uid, request)) {
                             const containers = Object.values(this.state.containers || {})
                                     .filter(container => container.uid === con.uid);
-                            this.updateSchedulerCoverage(con, containers);
+                            this.updateSchedulerCoverage(con, containers, request);
                         }
                     });
                 })
                 .catch(e => {
-                    if (!this.isCurrentConnection(con))
+                    if (!this.isCurrentConnection(con) || !this.schedulerRequests.isCurrent(con.uid, request))
                         return;
                     console.warn("updateContainer uid", con.uid, "inspectContainer failed:", e.toString());
                     this.setState(prevState => ({
@@ -658,7 +669,11 @@ class Application extends React.Component {
                     }));
                 });
         this.pendingUpdateContainer[key] = new_wait;
-        new_wait.finally(() => { delete this.pendingUpdateContainer[key] });
+        const clearPending = () => {
+            if (this.pendingUpdateContainer[key] === new_wait)
+                delete this.pendingUpdateContainer[key];
+        };
+        new_wait.then(clearPending, clearPending);
 
         return new_wait;
     }

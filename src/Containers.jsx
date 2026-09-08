@@ -345,6 +345,8 @@ const health_reason = (assessment) => {
             return _("No active matching health schedule");
         if (assessment.reason === "scheduler-unavailable" || assessment.reason === "scheduler-unknown")
             return _("Scheduler freshness is unknown");
+        if (assessment.reason === "latest-check-unknown")
+            return _("Latest health result is invalid");
         return assessment.reason === "freshness-unknown"
             ? _("Health result is present, but scheduler freshness is unknown")
             : _("No health result recorded");

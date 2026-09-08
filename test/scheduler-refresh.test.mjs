@@ -54,6 +54,22 @@ assert.equal(maxActive.get("2000"), 1);
 assert.equal(refreshGate.isCurrent(1000, ownerA.request), false);
 assert.equal(refreshGate.isCurrent(2000, ownerB.request), true);
 
+// The timer may enumerate many owner sockets. A per-owner gate alone would
+// still start one inventory and scheduler collector per owner at once; the
+// global cap keeps the next timer fire bounded while retaining owner
+// isolation.
+const globalGate = new OwnerRefreshGate(2);
+let globalActive = 0;
+let globalMaxActive = 0;
+const globalRuns = [1, 2, 3, 4].map(uid => globalGate.start(uid, async () => {
+    globalActive++;
+    globalMaxActive = Math.max(globalMaxActive, globalActive);
+    await new Promise(resolveResponse => setTimeout(resolveResponse, 4));
+    globalActive--;
+}));
+await Promise.all(globalRuns.map(entry => entry.promise));
+assert.equal(globalMaxActive, 2);
+
 let activeWorkers = 0;
 let maxWorkers = 0;
 const bounded = await mapWithConcurrency([1, 2, 3, 4, 5], async value => {
