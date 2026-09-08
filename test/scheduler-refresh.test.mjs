@@ -54,6 +54,29 @@ assert.equal(maxActive.get("2000"), 1);
 assert.equal(refreshGate.isCurrent(1000, ownerA.request), false);
 assert.equal(refreshGate.isCurrent(2000, ownerB.request), true);
 
+// Invalidating an in-flight owner must not make a reconnect reuse the old
+// promise.  The fresh generation waits for the old operation to settle even
+// when a global owner slot is available.
+const reconnectGate = new OwnerRefreshGate(2);
+const reconnectEvents = [];
+const staleReconnect = reconnectGate.start("reconnect-owner", async () => {
+    reconnectEvents.push("old-start");
+    await new Promise(resolveResponse => setTimeout(resolveResponse, 10));
+    reconnectEvents.push("old-done");
+    return "old-result";
+});
+reconnectGate.invalidate("reconnect-owner");
+const freshReconnect = reconnectGate.start("reconnect-owner", async () => {
+    reconnectEvents.push("fresh-start");
+    return "fresh-result";
+});
+assert.notEqual(staleReconnect, freshReconnect);
+assert.equal(await staleReconnect.promise, "old-result");
+assert.equal(await freshReconnect.promise, "fresh-result");
+assert.deepEqual(reconnectEvents, ["old-start", "old-done", "fresh-start"]);
+assert.equal(reconnectGate.isCurrent("reconnect-owner", staleReconnect.request), false);
+assert.equal(reconnectGate.isCurrent("reconnect-owner", freshReconnect.request), true);
+
 // The timer may enumerate many owner sockets. A per-owner gate alone would
 // still start one inventory and scheduler collector per owner at once; the
 // global cap keeps the next timer fire bounded while retaining owner

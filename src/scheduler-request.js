@@ -41,12 +41,17 @@ export class OwnerRefreshGate extends SchedulerRequestGate {
 
     start(uid, operation) {
         const key = schedulerOwnerKey(uid);
-        const current = this.running.get(key) || this.queued.get(key);
-        if (current)
-            if (this.running.has(key) || this.isCurrent(uid, current.request))
-                return current;
-            else
-                this.queued.delete(key);
+        const running = this.running.get(key);
+        const queued = this.queued.get(key);
+        // Coalesce only the generation that is still current.  An invalidated
+        // operation remains in flight so its late result can be discarded, but
+        // a reconnect must still get a fresh operation queued behind it.
+        if (running && this.isCurrent(uid, running.request))
+            return running;
+        if (queued && this.isCurrent(uid, queued.request))
+            return queued;
+        if (queued)
+            this.queued.delete(key);
 
         const request = this.begin(uid);
         let resolveEntry;
@@ -68,7 +73,13 @@ export class OwnerRefreshGate extends SchedulerRequestGate {
 
     drain() {
         while (this.running.size < this.maxConcurrentOwners && this.pending.length > 0) {
-            const entry = this.pending.shift();
+            // A fresh generation for an invalidated owner must wait for the
+            // old generation to settle even when another global slot is free.
+            // Search past blocked owners so unrelated contexts can continue.
+            const index = this.pending.findIndex(entry => !this.running.has(entry.key));
+            if (index < 0)
+                break;
+            const [entry] = this.pending.splice(index, 1);
             if (this.queued.get(entry.key) === entry)
                 this.queued.delete(entry.key);
             // A connection can disappear while an owner is waiting for a

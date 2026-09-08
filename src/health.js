@@ -149,21 +149,37 @@ const schedulerError = scheduler => {
     if (!scheduler)
         return null;
 
-    const errors = Array.isArray(scheduler.collector_errors)
-        ? scheduler.collector_errors
-        : [];
+    const errors = scheduler.collector_errors;
     const coverageStatus = scheduler.coverage_status;
     const coverageCount = scheduler.active_coverage_count;
-    if (coverageStatus !== undefined &&
-        !["covered", "covered-with-errors", "uncovered", "error"].includes(coverageStatus))
+    const declaredCoverageCount = scheduler.coverage_count;
+    if (!["covered", "covered-with-errors", "uncovered", "error"].includes(coverageStatus))
+        return SCHEDULER_ERROR;
+    if (!Array.isArray(errors))
+        return SCHEDULER_ERROR;
+    if (!Number.isInteger(coverageCount) || coverageCount < 0)
+        return SCHEDULER_ERROR;
+    if (!Number.isInteger(declaredCoverageCount) || declaredCoverageCount !== coverageCount)
         return SCHEDULER_ERROR;
     if (scheduler.error)
         return SCHEDULER_ERROR;
     if (coverageStatus === "error" || coverageStatus === "covered-with-errors")
         return SCHEDULER_ERROR;
-    if (coverageCount !== undefined &&
-        (!Number.isInteger(coverageCount) || coverageCount < 0 || coverageCount > 1))
+    if (coverageStatus === "covered" && coverageCount !== 1)
         return SCHEDULER_ERROR;
+    if (coverageStatus === "uncovered" && coverageCount !== 0)
+        return SCHEDULER_ERROR;
+    if (coverageStatus === "covered") {
+        const interval = Number(scheduler.effective_interval_seconds);
+        const jitter = Number(scheduler.jitter_seconds);
+        const accuracy = Number(scheduler.accuracy_seconds);
+        const source = scheduler.schedule_source || scheduler.effective_interval_source;
+        if (!Number.isFinite(interval) || interval <= 0 ||
+            !Number.isFinite(jitter) || jitter < 0 ||
+            !Number.isFinite(accuracy) || accuracy < 0 ||
+            typeof source !== "string" || source.length === 0)
+            return SCHEDULER_ERROR;
+    }
     if (errors.length > 0)
         return SCHEDULER_ERROR;
     return null;

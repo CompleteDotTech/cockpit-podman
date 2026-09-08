@@ -82,6 +82,31 @@ assert.equal(healthAssessment(fixtures.healthy.container, now, null, {
     collector_errors: [],
 }).status, healthStates.error);
 
+// A covered scheduler record must carry a complete, self-consistent count
+// and cadence. Missing or contradictory metadata must never produce green
+// health or a freshness window.
+const completeCovered = {
+    coverage_status: "covered",
+    active_coverage_count: 1,
+    coverage_count: 1,
+    effective_interval_seconds: 30,
+    jitter_seconds: 0,
+    accuracy_seconds: 1,
+    schedule_source: "systemd",
+    collector_errors: [],
+};
+assert.equal(healthAssessment(fixtures.healthy.container, now, null, completeCovered).status, healthStates.healthy);
+for (const [label, malformed] of [
+    ["missing active count", { ...completeCovered, active_coverage_count: undefined }],
+    ["zero covered count", { ...completeCovered, active_coverage_count: 0, coverage_count: 0 }],
+    ["mismatched counts", { ...completeCovered, coverage_count: 0 }],
+    ["missing collector errors", { ...completeCovered, collector_errors: undefined }],
+    ["missing cadence", { ...completeCovered, effective_interval_seconds: undefined }],
+    ["missing cadence source", { ...completeCovered, schedule_source: undefined }],
+])
+    assert.equal(healthAssessment(fixtures.healthy.container, now, null, malformed).status,
+                 healthStates.error, label);
+
 const collision = fixtures["permission-context-collision"];
 const healthyKey = `${collision.healthyOwner.uid}-${collision.sameId}`;
 const errorKey = `${collision.errorOwner.uid}-${collision.sameId}`;
@@ -119,6 +144,8 @@ assert.equal(healthAssessment(fixtures.stale.container, now, null, slowSchedule)
 assert.equal(healthAssessment(fixtures.stale.container, now, null, fixtures.stale.scheduler).staleAfterMs, 36000);
 assert.equal(healthAssessment(fixtures.healthy.container, now, null, {
     coverage_status: "uncovered",
+    active_coverage_count: 0,
+    coverage_count: 0,
     coverage_reason: "no-active-matching-health-timer",
     collector_errors: [],
 }).status, healthStates.unknown);
