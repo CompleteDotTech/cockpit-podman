@@ -43,6 +43,9 @@ const HEALTH_INSPECT_TIMEOUT_MS = 5000;
 const HEALTH_EVENT_INSPECT_TIMEOUT_MS = 5000;
 const HEALTH_INSPECT_CONCURRENCY = 8;
 const HEALTH_SCHEDULER_TIMEOUT_MS = 8000;
+// Stats are streamed independently for every owner. Coalesce a burst into a
+// single render while keeping the displayed values boundedly fresh.
+const CONTAINER_STATS_FLUSH_INTERVAL_MS = 100;
 
 const isContainerInventoryRow = container => container !== null &&
     typeof container === "object" && !Array.isArray(container) &&
@@ -119,6 +122,8 @@ class Application extends React.Component {
         // a queued request actually reaches the transport.
         this.containerRequestGate = new RequestConcurrencyGate(HEALTH_INSPECT_CONCURRENCY);
         this.containerInspectRequests = new KeyedRequestGate(operation => this.containerRequestGate.run(operation));
+        this.pendingContainerStats = new Map();
+        this.containerStatsTimers = new Map();
         this.ownerConnections = new Map();
         this.healthRefreshTimer = null;
         this.sessionUser = null;
@@ -272,14 +277,20 @@ class Application extends React.Component {
     }
 
     async withContainerRequestTimeout(request, timeoutMs, message) {
+        // If the queued request is canceled while waiting for a shared slot,
+        // its promise rejects before the result timeout is installed below.
+        // Observe that rejection immediately so a canceled inspect cannot
+        // become an unhandled rejection while we wait on request.started.
+        const observedRequest = Promise.resolve(request);
+        observedRequest.catch(() => undefined);
         const startedAt = Date.now();
         if (request.started) {
             const started = await withTimeout(request.started, timeoutMs, message,
-                                               () => request.close?.("timeout"));
+                                              () => request.close?.("timeout"));
             if (!started)
                 throw new Error(message);
         }
-        return withTimeout(request,
+        return withTimeout(observedRequest,
                            Math.max(1, timeoutMs - (Date.now() - startedAt)),
                            message,
                            () => request.close?.("timeout"));
@@ -603,13 +614,79 @@ class Application extends React.Component {
         }
     }
 
+    queueContainerStats(con, stats) {
+        if (!Array.isArray(stats) || stats.length === 0)
+            return;
+
+        const uid = con.uid;
+        let pending = this.pendingContainerStats.get(uid);
+        if (pending && pending.con !== con) {
+            const oldTimer = this.containerStatsTimers.get(uid);
+            if (oldTimer !== undefined) {
+                clearTimeout(oldTimer);
+                this.containerStatsTimers.delete(uid);
+            }
+            pending = null;
+        }
+        if (!pending)
+            pending = { con, values: {} };
+
+        for (const stat of stats) {
+            if (!stat || typeof stat.ContainerID !== "string")
+                continue;
+            pending.values[makeKey(uid, stat.ContainerID)] = stat;
+        }
+        if (Object.keys(pending.values).length === 0)
+            return;
+        this.pendingContainerStats.set(uid, pending);
+
+        if (this.containerStatsTimers.has(uid))
+            return;
+        const timer = setTimeout(() => {
+            this.containerStatsTimers.delete(uid);
+            const current = this.pendingContainerStats.get(uid);
+            if (!current || current !== pending)
+                return;
+            this.pendingContainerStats.delete(uid);
+            if (!this.isCurrentConnection(con))
+                return;
+            this.setState(prevState => ({
+                containersStats: { ...prevState.containersStats, ...current.values },
+            }));
+        }, CONTAINER_STATS_FLUSH_INTERVAL_MS);
+        this.containerStatsTimers.set(uid, timer);
+    }
+
+    clearContainerStats(con, removeState = false) {
+        const uid = con.uid;
+        const timer = this.containerStatsTimers.get(uid);
+        if (timer !== undefined) {
+            clearTimeout(timer);
+            this.containerStatsTimers.delete(uid);
+        }
+        const pending = this.pendingContainerStats.get(uid);
+        if (!pending || pending.con === con)
+            this.pendingContainerStats.delete(uid);
+        if (!removeState)
+            return;
+
+        this.setState(prevState => {
+            const ownerPrefix = `${uid ?? "user"}-`;
+            const containersStats = {};
+            Object.entries(prevState.containersStats || {}).forEach(([key, value]) => {
+                if (!key.startsWith(ownerPrefix))
+                    containersStats[key] = value;
+            });
+            return { containersStats };
+        });
+    }
+
     updateContainerStats(con) {
         client.streamContainerStats(con, reply => {
             if (reply.Error != null) // executed when container stop
                 console.warn("Failed to update container stats:", JSON.stringify(reply.message));
-            else {
-                reply.Stats.forEach(stat => this.updateState("containersStats", makeKey(con.uid, stat.ContainerID), stat));
-            }
+            else
+                this.queueContainerStats(con, reply.Stats);
         }).catch(ex => {
             if (ex.cause == "no support for CGroups V1 in rootless environments" || ex.cause == "Container stats resource only available for cgroup v2") {
                 console.log("This OS does not support CgroupsV2. Some information may be missing.");
@@ -1113,6 +1190,7 @@ class Application extends React.Component {
     cleanupAfterService(con) {
         if (!this.invalidateOwner(con))
             return;
+        this.clearContainerStats(con, true);
         debug("cleanupAfterService", con.uid, "current owner filter:", this.state.ownerFilter);
         this.setState(prevState => {
             const next = {};
@@ -1458,8 +1536,13 @@ class Application extends React.Component {
 
         if (this.healthRefreshTimer !== null)
             window.clearInterval(this.healthRefreshTimer);
-        for (const con of this.ownerConnections.values())
+        for (const con of this.ownerConnections.values()) {
             this.invalidateOwner(con);
+            this.clearContainerStats(con);
+        }
+        this.pendingContainerStats.clear();
+        this.containerStatsTimers.forEach(timer => clearTimeout(timer));
+        this.containerStatsTimers.clear();
         this.ownerConnections.clear();
 
         // Cleanup DBus subscriptions
