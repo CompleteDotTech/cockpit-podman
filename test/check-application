@@ -343,6 +343,52 @@ WantedBy=multi-user.target default.target
             self.addCleanup(self.execute, f"{systemctl_cmd} stop {name}.service", system=auth)
             self.execute(f"{systemctl_cmd} start {name}.service", system=auth)
 
+    def createHealthScheduler(self, container_name: str, *, auth: bool = False) -> None:
+        """Install the supported external health schedule used by this browser fixture.
+
+        Podman still owns the native health result and log.  The timer only
+        gives Cockpit's read-only scheduler collector an actual effective
+        cadence to inspect; without it a native-only disposable container is
+        correctly reported as having unknown freshness.
+        """
+        systemctl_cmd = "systemctl" if auth else "systemctl --user"
+        unit_dir = "/etc/systemd/system" if auth else "/home/admin/.config/systemd/user"
+        owner = None if auth else "admin:admin"
+        unit_stem = f"cockpit-podman-healthcheck-{container_name}"
+        service_unit = f"{unit_stem}.service"
+        timer_unit = f"{unit_stem}.timer"
+        service_file = f"{unit_dir}/{service_unit}"
+        timer_file = f"{unit_dir}/{timer_unit}"
+
+        if not auth:
+            self.machine.execute(f"install -d -o admin -g admin {unit_dir}")
+
+        service = f"""
+[Unit]
+Description=Cockpit Podman healthcheck fixture for {container_name}
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/podman healthcheck run {container_name}
+"""
+        timer = f"""
+[Unit]
+Description=Cockpit Podman healthcheck timer fixture for {container_name}
+
+[Timer]
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit={service_unit}
+"""
+
+        self.write_file(service_file, service, owner=owner)
+        self.write_file(timer_file, timer, owner=owner)
+        self.addCleanup(self.execute,
+                        f"{systemctl_cmd} stop {timer_unit} {service_unit} || true; {systemctl_cmd} daemon-reload",
+                        system=auth)
+        self.execute(f"{systemctl_cmd} daemon-reload; {systemctl_cmd} start {timer_unit}; "
+                     f"{systemctl_cmd} is-active {timer_unit}", system=auth)
+
     def createQuadletPod(self, name: str, podName: str | None = None, *, auth: bool = False) -> None:
         podName = podName if podName else name
         quadlet = f"""
@@ -2754,6 +2800,12 @@ Yaml={name}.yaml
 
         b.set_input_text("#run-image-dialog-name", "healthy")
 
+        # The health result remains native Podman state.  This matching timer
+        # supplies the real external cadence consumed by the display's
+        # scheduler collector, so the fixture does not rely on a green result
+        # while freshness is actually uncovered.
+        self.createHealthScheduler("healthy", auth=auth)
+
         b.click("#pf-tab-2-create-image-dialog-tab-healthcheck")
         b.set_input_text('#run-image-dialog-healthcheck-command', 'true')
         b.set_input_text('#run-image-healthcheck-interval input', '325')
@@ -2846,6 +2898,7 @@ Yaml={name}.yaml
             return
 
         containername = "healthaction"
+        self.createHealthScheduler(containername, auth=auth)
         b.set_input_text("#run-image-dialog-name", containername)
         b.set_input_text("#run-image-dialog-command", "/bin/sh -c 'echo 1 > /healthy && sleep infinity'")
 

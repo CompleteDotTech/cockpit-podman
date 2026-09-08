@@ -24,10 +24,24 @@ import Containers from './Containers.jsx';
 import Images from './Images.jsx';
 import * as client from './client.js';
 import detect_quadlets from './detect-quadlets.py';
+import scheduler_collector from './health-scheduler.py';
 import rest from './rest.js';
+import { mapWithConcurrency, OwnerRefreshGate, SchedulerRequestGate, withTimeout } from './scheduler-request.js';
 import { makeKey, WithPodmanInfo, debug } from './util.js';
 
 const _ = cockpit.gettext;
+
+const errorText = error => error?.message || error?.toString() || "Unknown error";
+const FULL_CONTAINER_ID = /^[0-9a-f]{64}$/;
+const SCHEDULER_SCHEMA = "train-health-scheduler-coverage/v1";
+const SCHEDULER_FAILURE = "scheduler-collector-failed";
+const SCHEDULER_INCOMPLETE = "scheduler-coverage-incomplete";
+const SCHEDULER_STATUSES = new Set(["covered", "covered-with-errors", "uncovered", "error"]);
+const HEALTH_REFRESH_INTERVAL_MS = 15000;
+const HEALTH_REFRESH_TIMEOUT_MS = 15000;
+const HEALTH_INSPECT_TIMEOUT_MS = 5000;
+const HEALTH_INSPECT_CONCURRENCY = 8;
+const HEALTH_SCHEDULER_TIMEOUT_MS = 8000;
 
 // sort order of "users" state for dialogs: system, session user, then other users by ascending name
 function compareUser(a, b) {
@@ -51,6 +65,16 @@ class Application extends React.Component {
             users: [{ con: null, uid: 0, name: _("system"), dbus: null }, { con: null, uid: null, name: _("user"), dbus: null }],
             images: null,
             containers: null,
+            // A failed inspect invalidates any previously cached health result
+            // for the same (owner, full container ID) key.
+            containerErrors: {},
+            // A context-level failure covers every cached row belonging to the
+            // affected Podman socket until a successful refresh clears it.
+            contextErrors: {},
+            // Effective systemd/native scheduler metadata is keyed by the
+            // display's owner-scoped full container ID.
+            schedulerCoverage: {},
+            schedulerErrors: {},
             containersFilter: "all",
             containersStats: {},
             // Mapping of quadlet containers and pods on the system to show
@@ -80,6 +104,11 @@ class Application extends React.Component {
         this.onNavigate = this.onNavigate.bind(this);
 
         this.pendingUpdateContainer = {}; // key (uid-id) → promise
+        this.schedulerRequests = new SchedulerRequestGate();
+        this.healthRefreshGate = new OwnerRefreshGate();
+        this.ownerConnections = new Map();
+        this.healthRefreshTimer = null;
+        this.sessionUser = null;
     }
 
     onAddNotification(notification) {
@@ -154,6 +183,284 @@ class Application extends React.Component {
         });
     }
 
+    schedulerUid(con) {
+        return con.uid === null ? this.sessionUser?.id ?? null : con.uid;
+    }
+
+    isCurrentConnection(con) {
+        return this.ownerConnections.get(con.uid) === con;
+    }
+
+    invalidateOwner(con) {
+        const uid = typeof con === "object" ? con.uid : con;
+        if (typeof con === "object" && this.ownerConnections.get(uid) !== con)
+            return false;
+        this.healthRefreshGate.invalidate(uid);
+        this.schedulerRequests.begin(uid);
+        if (typeof con === "object" && this.ownerConnections.get(uid) === con)
+            this.ownerConnections.delete(uid);
+        return true;
+    }
+
+    refreshHealthOwners() {
+        for (const user of this.state.users) {
+            if (user.con && user.containersLoaded)
+                this.refreshOwnerHealth(user.con);
+        }
+    }
+
+    refreshOwnerHealth(con) {
+        const entry = this.healthRefreshGate.start(con.uid, request => this.collectOwnerHealth(con, request));
+        return entry.promise.catch(error => {
+            console.warn("periodic health refresh failed", { uid: con.uid, stage: "health-refresh", error: error?.message || "unknown" });
+        });
+    }
+
+    async collectOwnerHealth(con, request) {
+        if (!this.isCurrentConnection(con) || !this.healthRefreshGate.isCurrent(con.uid, request))
+            return;
+
+        const refreshDeadline = Date.now() + HEALTH_REFRESH_TIMEOUT_MS;
+        let containerList;
+        try {
+            containerList = await withTimeout(client.getContainers(con),
+                                              Math.max(1, refreshDeadline - Date.now()),
+                                              "Container inventory refresh timed out");
+            if (!Array.isArray(containerList))
+                throw new Error("container inventory is not an array");
+        } catch (error) {
+            if (this.isCurrentConnection(con) && this.healthRefreshGate.isCurrent(con.uid, request)) {
+                this.setState(prevState => ({
+                    contextErrors: { ...prevState.contextErrors, [con.uid]: errorText(error) },
+                }));
+                // Invalidate any scheduler response collected for a snapshot
+                // that could not be reconciled with a fresh Podman inventory.
+                this.schedulerRequests.begin(con.uid);
+            }
+            return;
+        }
+
+        const results = await mapWithConcurrency(containerList, async container => {
+            const remaining = Math.min(HEALTH_INSPECT_TIMEOUT_MS, refreshDeadline - Date.now());
+            if (remaining <= 0)
+                return { container, error: new Error("Container health refresh timed out") };
+            try {
+                const detail = await withTimeout(client.inspectContainer(con, container.Id), remaining,
+                                                 "Container inspect timed out");
+                return { container, detail };
+            } catch (error) {
+                return { container, error };
+            }
+        }, HEALTH_INSPECT_CONCURRENCY);
+        if (!this.isCurrentConnection(con) || !this.healthRefreshGate.isCurrent(con.uid, request))
+            return;
+
+        const snapshot = [];
+        const errors = {};
+        for (const result of results) {
+            const id = result.container.Id;
+            const key = makeKey(con.uid, id);
+            if (result.error) {
+                const old = this.state.containers?.[key];
+                snapshot.push(old || {
+                    ...result.container,
+                    Id: id,
+                    Name: result.container.Names?.[0]?.replace(/^\//, "") || id,
+                    ImageName: result.container.ImageName || result.container.Image,
+                    Config: result.container.Config || {},
+                    State: { Status: String(result.container.State || "").toLowerCase() },
+                    uid: con.uid,
+                    key,
+                });
+                errors[key] = errorText(result.error);
+            } else {
+                const detail = { ...result.detail, uid: con.uid, key };
+                snapshot.push(detail);
+            }
+        }
+
+        this.setState(prevState => {
+            if (!this.isCurrentConnection(con) || !this.healthRefreshGate.isCurrent(con.uid, request))
+                return null;
+
+            const containers = {};
+            const containerErrors = {};
+            Object.entries(prevState.containers || {}).forEach(([key, container]) => {
+                if (container.uid !== con.uid) {
+                    containers[key] = container;
+                    if (prevState.containerErrors?.[key])
+                        containerErrors[key] = prevState.containerErrors[key];
+                }
+            });
+            snapshot.forEach(container => {
+                containers[container.key] = container;
+                if (errors[container.key])
+                    containerErrors[container.key] = errors[container.key];
+            });
+            const contextErrors = { ...prevState.contextErrors };
+            delete contextErrors[con.uid];
+            return { containers, containerErrors, contextErrors };
+        });
+
+        if (!this.isCurrentConnection(con) || !this.healthRefreshGate.isCurrent(con.uid, request))
+            return;
+        if (Date.now() < refreshDeadline)
+            await this.updateSchedulerCoverage(con, snapshot, null, request);
+    }
+
+    schedulerErrorRecord(con, container, contextUid, reason) {
+        return {
+            key: makeKey(con.uid, container.Id),
+            uid: contextUid,
+            container_id: container.Id,
+            name: container.Name,
+            active_coverage_count: 0,
+            coverage_count: 0,
+            effective_interval_seconds: null,
+            effective_interval_source: null,
+            jitter_seconds: null,
+            accuracy_seconds: null,
+            schedules: [],
+            coverage_status: "error",
+            coverage_reason: "collector-error",
+            collector_errors: [reason],
+        };
+    }
+
+    applySchedulerCoverage(con, contextUid, containers, coverage, failure = null, request = null) {
+        if (!this.isCurrentConnection(con))
+            return false;
+        if (request && !this.schedulerRequests.isCurrent(con.uid, request))
+            return false;
+        // Collector diagnostics are intentionally reduced to static codes at
+        // the UI boundary.  Cockpit errors can contain URLs, command lines,
+        // and health output; none belongs in a badge, title, or reason.
+        const sourceErrors = Array.isArray(coverage?.collector_errors) ? coverage.collector_errors : [];
+        const topErrors = failure ? [SCHEDULER_FAILURE] : (sourceErrors.length > 0 ? [SCHEDULER_INCOMPLETE] : []);
+        const rawRecords = coverage?.containers && typeof coverage.containers === "object"
+            ? coverage.containers
+            : {};
+        const records = {};
+        for (const container of containers) {
+            const id = container.Id;
+            const key = makeKey(con.uid, id);
+            const candidate = FULL_CONTAINER_ID.test(id)
+                ? rawRecords[`${contextUid}-${id}`]
+                : null;
+            let record = candidate && typeof candidate === "object" && !Array.isArray(candidate) &&
+                SCHEDULER_STATUSES.has(candidate.coverage_status)
+                ? candidate
+                : null;
+            if (!record) {
+                record = this.schedulerErrorRecord(con, container, contextUid,
+                                                   FULL_CONTAINER_ID.test(id)
+                                                       ? (candidate ? "scheduler-record-invalid" : "scheduler-record-missing")
+                                                       : "scheduler-container-id-invalid");
+            } else {
+                record = { ...record, key };
+            }
+            if (topErrors.length > 0) {
+                record = {
+                    ...record,
+                    coverage_status: "error",
+                    coverage_reason: "collector-error",
+                    collector_errors: [...(record.collector_errors || []), ...topErrors],
+                };
+            }
+            const recordErrors = Array.isArray(record.collector_errors) && record.collector_errors.length > 0
+                ? [SCHEDULER_INCOMPLETE]
+                : [];
+            record.collector_errors = [...new Set([...recordErrors, ...topErrors])];
+            records[key] = record;
+        }
+
+        const ownerPrefix = `${con.uid ?? "user"}-`;
+        this.setState(prevState => {
+            if (request && !this.schedulerRequests.isCurrent(con.uid, request))
+                return null;
+            const schedulerCoverage = {};
+            Object.entries(prevState.schedulerCoverage || {}).forEach(([key, value]) => {
+                if (!key.startsWith(ownerPrefix))
+                    schedulerCoverage[key] = value;
+            });
+            Object.assign(schedulerCoverage, records);
+            const schedulerErrors = { ...(prevState.schedulerErrors || {}) };
+            if (topErrors.length > 0)
+                schedulerErrors[con.uid] = topErrors[0];
+            else
+                delete schedulerErrors[con.uid];
+            return { schedulerCoverage, schedulerErrors };
+        });
+        return true;
+    }
+
+    async updateSchedulerCoverage(con, containers, request = null, refreshRequest = null) {
+        if (!this.isCurrentConnection(con) ||
+            (refreshRequest && !this.healthRefreshGate.isCurrent(con.uid, refreshRequest)))
+            return;
+        request ||= this.schedulerRequests.begin(con.uid);
+        const contextUid = this.schedulerUid(con);
+        if (!Number.isInteger(contextUid) || contextUid < 0) {
+            this.applySchedulerCoverage(con, null, containers, null, "Session user UID is unavailable", request);
+            return;
+        }
+
+        const identity = {
+            containers: containers.map(container => ({
+                uid: contextUid,
+                id: container.Id,
+                name: container.Name || container.Names?.[0]?.replace(/^\//, "") || null,
+            })),
+        };
+        const owner = this.state.users.find(user => user.uid === con.uid);
+        const options = {
+            err: "message",
+            environ: ["LC_ALL=C"],
+        };
+        let process;
+        if (con.uid === null || con.uid === 0) {
+            if (con.uid === 0)
+                options.superuser = "require";
+            process = python.spawn(scheduler_collector,
+                                   ["--uid", String(contextUid), "--timeout", "8"], options);
+        } else {
+            // A numeric --uid alone must never make root's systemctl --user
+            // manager look like another user's manager. Run the helper in the
+            // actual service user's bridge context instead.
+            if (!owner?.name) {
+                this.applySchedulerCoverage(con, contextUid, containers, null, "Service user name is unavailable", request);
+                return;
+            }
+            process = cockpit.spawn([
+                "runuser", "--preserve-environment", "-u", owner.name, "--",
+                "/usr/bin/python3", "-c", scheduler_collector,
+                "--uid", String(contextUid), "--timeout", "8",
+            ], {
+                ...options,
+                superuser: "require",
+                environ: ["LC_ALL=C", `XDG_RUNTIME_DIR=/run/user/${contextUid}`],
+            });
+        }
+
+        try {
+            process.input(JSON.stringify(identity));
+            process.input(null);
+            const output = JSON.parse(await withTimeout(process, HEALTH_SCHEDULER_TIMEOUT_MS,
+                                                        "Scheduler coverage collection timed out"));
+            if (refreshRequest && !this.healthRefreshGate.isCurrent(con.uid, refreshRequest))
+                return;
+            if (output.schema !== SCHEDULER_SCHEMA || output.uid !== contextUid ||
+                !output.containers || typeof output.containers !== "object")
+                throw new Error("Scheduler collector returned an invalid schema");
+            this.applySchedulerCoverage(con, contextUid, containers, output, null, request);
+        } catch {
+            if (refreshRequest && !this.healthRefreshGate.isCurrent(con.uid, refreshRequest))
+                return;
+            console.warn("scheduler coverage collection failed", { uid: con.uid, stage: "scheduler-collector" });
+            this.applySchedulerCoverage(con, contextUid, containers, null, SCHEDULER_FAILURE, request);
+        }
+    }
+
     updateContainerStats(con) {
         client.streamContainerStats(con, reply => {
             if (reply.Error != null) // executed when container stop
@@ -170,30 +477,81 @@ class Application extends React.Component {
     }
 
     initContainers(con) {
+        this.healthRefreshGate.invalidate(con.uid);
+        const request = this.schedulerRequests.begin(con.uid);
         return client.getContainers(con)
-                .then(containerList => Promise.all(
-                    containerList.map(container => client.inspectContainer(con, container.Id))
-                ))
-                .then(containerDetails => {
+                .then(containerList => Promise.all(containerList.map(container =>
+                    client.inspectContainer(con, container.Id)
+                            .then(detail => ({ container, detail }))
+                            .catch(error => ({ container, error }))
+                )))
+                .then(results => {
+                    if (!this.isCurrentConnection(con) || !this.schedulerRequests.isCurrent(con.uid, request))
+                        return;
+                    const schedulerContainers = results.map(result => result.detail || result.container);
                     this.setState(prevState => {
+                        if (!this.isCurrentConnection(con) || !this.schedulerRequests.isCurrent(con.uid, request))
+                            return null;
                         // keep/copy the containers of other users
                         const copyContainers = {};
+                        const copyContainerErrors = {};
                         Object.entries(prevState.containers || {}).forEach(([id, container]) => {
-                            if (container.uid !== con.uid)
+                            if (container.uid !== con.uid) {
                                 copyContainers[id] = container;
+                                if (prevState.containerErrors?.[id])
+                                    copyContainerErrors[id] = prevState.containerErrors[id];
+                            }
                         });
-                        for (const detail of containerDetails) {
+                        for (const result of results) {
+                            const id = result.container.Id;
+                            const key = makeKey(con.uid, id);
+                            if (result.error) {
+                                // Keep a row when possible so the owner and
+                                // full ID remain visible while inspect is down.
+                                const old = prevState.containers?.[key];
+                                const detail = old || {
+                                    ...result.container,
+                                    Id: id,
+                                    Name: result.container.Names?.[0]?.replace(/^\//, "") || id,
+                                    ImageName: result.container.ImageName || result.container.Image,
+                                    Config: result.container.Config || {},
+                                    State: { Status: String(result.container.State || "").toLowerCase() },
+                                    uid: con.uid,
+                                    key,
+                                };
+                                copyContainers[key] = detail;
+                                copyContainerErrors[key] = errorText(result.error);
+                                continue;
+                            }
+
+                            const detail = result.detail;
                             detail.uid = con.uid;
-                            detail.key = makeKey(con.uid, detail.Id);
-                            copyContainers[detail.key] = detail;
+                            detail.key = key;
+                            copyContainers[key] = detail;
                         }
 
                         const users = prevState.users.map(u => u.uid === con.uid ? { ...u, containersLoaded: true } : u);
-                        return { containers: copyContainers, users };
+                        const contextErrors = { ...prevState.contextErrors };
+                        delete contextErrors[con.uid];
+                        return { containers: copyContainers, containerErrors: copyContainerErrors, contextErrors, users };
                     });
                     this.updateContainerStats(con);
+                    this.updateSchedulerCoverage(con, schedulerContainers, request);
                 })
-                .catch(e => console.warn("initContainers uid", con.uid, "getContainers failed:", e.toString()));
+                .catch(e => {
+                    if (!this.isCurrentConnection(con) || !this.schedulerRequests.isCurrent(con.uid, request))
+                        return;
+                    console.warn("initContainers uid", con.uid, "getContainers failed:", e.toString());
+                    this.setState(prevState => {
+                        const users = prevState.users.map(u => u.uid === con.uid ? { ...u, containersLoaded: true } : u);
+                        return {
+                            containers: prevState.containers || {},
+                            contextErrors: { ...prevState.contextErrors, [con.uid]: errorText(e) },
+                            users,
+                        };
+                    });
+                    this.applySchedulerCoverage(con, this.schedulerUid(con), [], null, errorText(e), request);
+                });
     }
 
     updateImages(con) {
@@ -249,6 +607,13 @@ class Application extends React.Component {
     }
 
     updateContainer(con, id, event) {
+        if (!this.isCurrentConnection(con))
+            return Promise.resolve();
+        // A Podman event is newer than a periodic snapshot that may still be
+        // in flight.  Invalidate that snapshot and let the serialized inspect
+        // below become the owner-scoped source of truth.
+        this.healthRefreshGate.invalidate(con.uid);
+        this.schedulerRequests.begin(con.uid);
         /* when firing off multiple calls in parallel, podman can return them in a random order.
          * This messes up the state. So we need to serialize them for a particular container. */
         const key = makeKey(con.uid, id);
@@ -256,15 +621,42 @@ class Application extends React.Component {
 
         const new_wait = wait.then(() => client.inspectContainer(con, id))
                 .then(details => {
+                    if (!this.isCurrentConnection(con))
+                        return;
                     details.uid = con.uid;
                     details.key = key;
                     // HACK: during restart State never changes from "running"
                     //       override it to reconnect console after restart
                     if (event?.Action === "restart")
                         details.State.Status = "restarting";
-                    this.updateState("containers", key, details);
+                    this.setState(prevState => {
+                        if (!this.isCurrentConnection(con))
+                            return null;
+                        const containerErrors = { ...prevState.containerErrors };
+                        delete containerErrors[key];
+                        const contextErrors = { ...prevState.contextErrors };
+                        delete contextErrors[con.uid];
+                        return {
+                            containers: { ...prevState.containers, [key]: details },
+                            containerErrors,
+                            contextErrors,
+                        };
+                    }, () => {
+                        if (["create", "rename", "start"].includes(event?.Action)) {
+                            const containers = Object.values(this.state.containers || {})
+                                    .filter(container => container.uid === con.uid);
+                            this.updateSchedulerCoverage(con, containers);
+                        }
+                    });
                 })
-                .catch(e => console.warn("updateContainer uid", con.uid, "inspectContainer failed:", e.toString()));
+                .catch(e => {
+                    if (!this.isCurrentConnection(con))
+                        return;
+                    console.warn("updateContainer uid", con.uid, "inspectContainer failed:", e.toString());
+                    this.setState(prevState => ({
+                        containerErrors: { ...prevState.containerErrors, [key]: errorText(e) }
+                    }));
+                });
         this.pendingUpdateContainer[key] = new_wait;
         new_wait.finally(() => { delete this.pendingUpdateContainer[key] });
 
@@ -366,9 +758,15 @@ class Application extends React.Component {
             break;
 
         case 'remove':
+            this.healthRefreshGate.invalidate(con.uid);
+            this.schedulerRequests.begin(con.uid);
             this.setState(prevState => {
                 const containers = { ...prevState.containers };
                 delete containers[makeKey(con.uid, id)];
+                const containerErrors = { ...prevState.containerErrors };
+                delete containerErrors[makeKey(con.uid, id)];
+                const schedulerCoverage = { ...prevState.schedulerCoverage };
+                delete schedulerCoverage[makeKey(con.uid, id)];
                 let pods;
 
                 if (event.Actor.Attributes.podId) {
@@ -383,8 +781,10 @@ class Application extends React.Component {
                     this.updatePods(con);
                 }
 
-                return { containers, pods };
+                return { containers, containerErrors, schedulerCoverage, pods };
             });
+            this.updateSchedulerCoverage(con, Object.values(this.state.containers || {})
+                    .filter(container => container.uid === con.uid && container.Id !== id));
             break;
 
         // only needs to update the Image list, this ought to be an image event
@@ -435,17 +835,36 @@ class Application extends React.Component {
     }
 
     cleanupAfterService(con) {
+        if (!this.invalidateOwner(con))
+            return;
         debug("cleanupAfterService", con.uid, "current owner filter:", this.state.ownerFilter);
-        ["images", "containers", "pods"].forEach(t => {
-            if (this.state[t])
-                this.setState(prevState => {
-                    const copy = {};
-                    Object.entries(prevState[t] || {}).forEach(([id, v]) => {
-                        if (v.uid !== con.uid)
-                            copy[id] = v;
-                    });
-                    return { [t]: copy };
+        this.setState(prevState => {
+            const next = {};
+            ["images", "containers", "pods"].forEach(t => {
+                if (!prevState[t])
+                    return;
+                next[t] = {};
+                Object.entries(prevState[t]).forEach(([id, value]) => {
+                    if (value.uid !== con.uid)
+                        next[t][id] = value;
                 });
+            });
+
+            const containerErrors = {};
+            Object.entries(prevState.containerErrors || {}).forEach(([id, error]) => {
+                if (!id.startsWith(`${con.uid ?? "user"}-`))
+                    containerErrors[id] = error;
+            });
+            const contextErrors = { ...prevState.contextErrors };
+            delete contextErrors[con.uid];
+            const schedulerCoverage = {};
+            Object.entries(prevState.schedulerCoverage || {}).forEach(([id, value]) => {
+                if (!id.startsWith(`${con.uid ?? "user"}-`))
+                    schedulerCoverage[id] = value;
+            });
+            const schedulerErrors = { ...prevState.schedulerErrors };
+            delete schedulerErrors[con.uid];
+            return { ...next, containerErrors, contextErrors, schedulerCoverage, schedulerErrors };
         });
 
         // keep dummy (null) connections from other users, only remove valid ones
@@ -636,6 +1055,7 @@ class Application extends React.Component {
             await cockpit.spawn(start_args, { superuser: uid === null ? null : "require", err: "message", environ });
             con = rest.connect(uid);
             const reply = await client.getInfo(con);
+            this.ownerConnections.set(uid, con);
             this.setState(prevState => {
                 const users = prevState.users.filter(u => u.uid !== uid);
                 users.push({ con, uid, name: username, containersLoaded: false, podsLoaded: false, imagesLoaded: false, quadletsLoaded: false });
@@ -677,9 +1097,11 @@ class Application extends React.Component {
     }
 
     componentDidMount() {
+        this.healthRefreshTimer = window.setInterval(() => this.refreshHealthOwners(), HEALTH_REFRESH_INTERVAL_MS);
         superuser.addEventListener("changed", () => this.init(0, _("system")));
 
         cockpit.user().then(user => {
+            this.sessionUser = user;
             // there is no "user service" for root, ignore that
             if (user.id === 0) {
                 // clear the dummy init user, otherwise UI waits forever for initialization
@@ -754,6 +1176,12 @@ class Application extends React.Component {
 
     componentWillUnmount() {
         cockpit.removeEventListener("locationchanged", this.onNavigate);
+
+        if (this.healthRefreshTimer !== null)
+            window.clearInterval(this.healthRefreshTimer);
+        for (const con of this.ownerConnections.values())
+            this.invalidateOwner(con);
+        this.ownerConnections.clear();
 
         // Cleanup DBus subscriptions
         this.state.users.forEach(user => {
@@ -897,6 +1325,10 @@ class Application extends React.Component {
                 version={this.state.version}
                 images={loadingImages ? null : this.state.images}
                 containers={loadingContainers ? null : this.state.containers}
+                containerErrors={this.state.containerErrors}
+                contextErrors={this.state.contextErrors}
+                schedulerCoverage={this.state.schedulerCoverage}
+                schedulerErrors={this.state.schedulerErrors}
                 pods={loadingPods ? null : this.state.pods}
                 containersStats={this.state.containersStats}
                 filter={this.state.containersFilter}
