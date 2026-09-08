@@ -109,6 +109,8 @@ class Application extends React.Component {
         this.onNavigate = this.onNavigate.bind(this);
 
         this.pendingUpdateContainer = {}; // key (uid-id) → promise
+        this.containerEventGenerations = new Map();
+        this.containerEventActions = new Map();
         this.schedulerRequests = new SchedulerRequestGate();
         this.healthRefreshGate = new OwnerRefreshGate();
         this.ownerConnections = new Map();
@@ -196,12 +198,27 @@ class Application extends React.Component {
         return this.ownerConnections.get(con.uid) === con;
     }
 
+    markContainerEvent(con, id, action) {
+        const key = makeKey(con.uid, id);
+        const generation = (this.containerEventGenerations.get(key) || 0) + 1;
+        this.containerEventGenerations.set(key, generation);
+        this.containerEventActions.set(key, action || "update");
+        return generation;
+    }
+
     invalidateOwner(con) {
         const uid = typeof con === "object" ? con.uid : con;
         if (typeof con === "object" && this.ownerConnections.get(uid) !== con)
             return false;
         this.healthRefreshGate.invalidate(uid);
         this.schedulerRequests.begin(uid);
+        const ownerPrefix = `${uid ?? "user"}-`;
+        for (const key of this.containerEventGenerations.keys()) {
+            if (key.startsWith(ownerPrefix)) {
+                this.containerEventGenerations.delete(key);
+                this.containerEventActions.delete(key);
+            }
+        }
         if (typeof con === "object" && this.ownerConnections.get(uid) === con)
             this.ownerConnections.delete(uid);
         return true;
@@ -519,7 +536,17 @@ class Application extends React.Component {
         this.healthRefreshGate.invalidate(con.uid);
         const entry = this.healthRefreshGate.start(con.uid, refreshRequest =>
             this.collectInitialContainers(con, refreshRequest));
-        return entry.promise.catch(error => {
+        return entry.promise.then(() => {
+            // An event can invalidate the initial inventory after Podman has
+            // returned it but before the guarded state commit.  The old
+            // generation then resolves without marking the owner loaded; make
+            // that lifecycle self-healing instead of leaving the page in a
+            // permanent container-loading state.
+            if (this.isCurrentConnection(con) &&
+                !this.healthRefreshGate.isCurrent(con.uid, entry.request) &&
+                !this.state.users.find(user => user.uid === con.uid)?.containersLoaded)
+                return this.initContainers(con);
+        }).catch(error => {
             console.warn("initContainers uid", con.uid, "failed:", error?.toString?.() || error);
             this.markOwnerHealthUnavailable(con, entry.request, error);
             this.setState(prevState => {
@@ -539,6 +566,12 @@ class Application extends React.Component {
                                                      "Initial container inventory timed out");
             if (!Array.isArray(containerList))
                 throw new Error("container inventory is not an array");
+            const initialEventGenerations = new Map();
+            for (const container of containerList) {
+                if (isContainerInventoryRow(container))
+                    initialEventGenerations.set(container.Id,
+                                                this.containerEventGenerations.get(makeKey(con.uid, container.Id)) || 0);
+            }
             const results = await mapWithConcurrency(containerList, async container => {
                 if (!isContainerInventoryRow(container))
                     return { container, error: new Error("Container inventory row is invalid") };
@@ -553,9 +586,7 @@ class Application extends React.Component {
                     return { container, error };
                 }
             }, HEALTH_INSPECT_CONCURRENCY);
-            if (!this.isCurrentConnection(con) ||
-                !this.healthRefreshGate.isCurrent(con.uid, refreshRequest) ||
-                !this.schedulerRequests.isCurrent(con.uid, request))
+            if (!this.isCurrentConnection(con))
                 return;
 
             const validResults = results.filter(result => isContainerInventoryRow(result.container));
@@ -563,9 +594,9 @@ class Application extends React.Component {
             const schedulerContainers = validResults.map(result =>
                 isContainerInventoryRow(result.detail) ? result.detail : result.container);
             this.setState(prevState => {
+                const stillLoading = !prevState.users.find(user => user.uid === con.uid)?.containersLoaded;
                 if (!this.isCurrentConnection(con) ||
-                    !this.healthRefreshGate.isCurrent(con.uid, refreshRequest) ||
-                    !this.schedulerRequests.isCurrent(con.uid, request))
+                    (!this.healthRefreshGate.isCurrent(con.uid, refreshRequest) && !stillLoading))
                     return null;
                 // keep/copy the containers of other users
                 const copyContainers = {};
@@ -580,6 +611,20 @@ class Application extends React.Component {
                 for (const result of validResults) {
                     const id = result.container.Id;
                     const key = makeKey(con.uid, id);
+                    const snapshotGeneration = initialEventGenerations.get(id) || 0;
+                    const currentGeneration = this.containerEventGenerations.get(key) || 0;
+                    const eventAction = this.containerEventActions.get(key);
+                    if (currentGeneration !== snapshotGeneration) {
+                        if (eventAction === "remove")
+                            continue;
+                        const current = prevState.containers?.[key];
+                        if (current) {
+                            copyContainers[key] = current;
+                            if (prevState.containerErrors?.[key])
+                                copyContainerErrors[key] = prevState.containerErrors[key];
+                            continue;
+                        }
+                    }
                     const invalidDetail = !result.error && !isContainerInventoryRow(result.detail);
                     if (result.error || invalidDetail) {
                         // Keep a row when possible so the owner and full ID
@@ -625,15 +670,13 @@ class Application extends React.Component {
             await this.updateSchedulerCoverage(con, schedulerContainers, request, refreshRequest,
                                                Math.min(HEALTH_SCHEDULER_TIMEOUT_MS, deadline - Date.now()));
         } catch (error) {
-            if (!this.isCurrentConnection(con) ||
-                !this.healthRefreshGate.isCurrent(con.uid, refreshRequest) ||
-                !this.schedulerRequests.isCurrent(con.uid, request))
+            if (!this.isCurrentConnection(con))
                 return;
             console.warn("initContainers uid", con.uid, "getContainers failed:", error?.toString?.() || error);
             this.setState(prevState => {
+                const stillLoading = !prevState.users.find(user => user.uid === con.uid)?.containersLoaded;
                 if (!this.isCurrentConnection(con) ||
-                    !this.healthRefreshGate.isCurrent(con.uid, refreshRequest) ||
-                    !this.schedulerRequests.isCurrent(con.uid, request))
+                    (!this.healthRefreshGate.isCurrent(con.uid, refreshRequest) && !stillLoading))
                     return null;
                 const users = prevState.users.map(u => u.uid === con.uid ? { ...u, containersLoaded: true } : u);
                 return {
@@ -701,14 +744,17 @@ class Application extends React.Component {
     updateContainer(con, id, event) {
         if (!this.isCurrentConnection(con))
             return Promise.resolve();
+        const key = makeKey(con.uid, id);
+        this.markContainerEvent(con, id, event?.Action);
         // A Podman event is newer than a periodic snapshot that may still be
         // in flight.  Invalidate that snapshot and let the serialized inspect
         // below become the owner-scoped source of truth.
-        this.healthRefreshGate.invalidate(con.uid);
+        const initialLoading = !this.state.users.find(user => user.uid === con.uid)?.containersLoaded;
+        if (!(initialLoading && ["health_status", "exec_died"].includes(event?.Action)))
+            this.healthRefreshGate.invalidate(con.uid);
         const request = this.schedulerRequests.begin(con.uid);
         /* when firing off multiple calls in parallel, podman can return them in a random order.
          * This messes up the state. So we need to serialize them for a particular container. */
-        const key = makeKey(con.uid, id);
         const wait = this.pendingUpdateContainer[key] ?? Promise.resolve();
 
         const new_wait = wait.then(() => withTimeout(client.inspectContainer(con, id),
@@ -854,6 +900,7 @@ class Application extends React.Component {
             break;
 
         case 'remove': {
+            this.markContainerEvent(con, id, event?.Action || "remove");
             this.healthRefreshGate.invalidate(con.uid);
             const request = this.schedulerRequests.begin(con.uid);
             this.setState(prevState => {

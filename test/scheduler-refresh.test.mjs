@@ -77,6 +77,60 @@ assert.deepEqual(reconnectEvents, ["old-start", "old-done", "fresh-start"]);
 assert.equal(reconnectGate.isCurrent("reconnect-owner", staleReconnect.request), false);
 assert.equal(reconnectGate.isCurrent("reconnect-owner", freshReconnect.request), true);
 
+// Model the initial-load lifecycle: an invalidated generation may resolve
+// without committing `containersLoaded`, so the caller must start the queued
+// fresh generation and eventually settle loaded state.
+const initialLifecycleGate = new OwnerRefreshGate(2);
+let initialLoaded = false;
+let initialRuns = 0;
+const runInitialLoad = () => {
+    initialLifecycleGate.invalidate("initial-owner");
+    const entry = initialLifecycleGate.start("initial-owner", async request => {
+        initialRuns++;
+        await new Promise(resolveResponse => setTimeout(resolveResponse, 2));
+        if (!initialLifecycleGate.isCurrent("initial-owner", request))
+            return;
+        initialLoaded = true;
+    });
+    return entry.promise.then(() => {
+        if (!initialLoaded)
+            return runInitialLoad();
+    });
+};
+const initialLoad = runInitialLoad();
+initialLifecycleGate.invalidate("initial-owner");
+await initialLoad;
+assert.equal(initialLoaded, true);
+assert.equal(initialRuns, 2);
+
+// Health events can arrive continuously while both owner inventories are
+// inspected. They merge through the per-container path and must not cancel
+// the initial owner load; exercise the observed 84/72-row scopes.
+const eventFloodGate = new OwnerRefreshGate(2);
+const eventFloodLoaded = new Set();
+const eventFloodCounts = new Map();
+const eventFloodLoads = [84, 72].map((rowCount, ownerIndex) => {
+    const uid = `event-flood-${ownerIndex}`;
+    const entry = eventFloodGate.start(uid, async request => {
+        const rows = Array.from({ length: rowCount }, (_, index) => index);
+        await mapWithConcurrency(rows, async row => {
+            await new Promise(resolveResponse => setTimeout(resolveResponse, 1));
+            return row;
+        }, 8);
+        if (eventFloodGate.isCurrent(uid, request))
+            eventFloodLoaded.add(uid);
+    });
+    const events = setInterval(() => {
+        eventFloodCounts.set(uid, (eventFloodCounts.get(uid) || 0) + 1);
+        // health_status events merge through the per-container inspect path;
+        // they do not invalidate the owner initial generation.
+    }, 1);
+    return entry.promise.finally(() => clearInterval(events));
+});
+await Promise.all(eventFloodLoads);
+assert.deepEqual([...eventFloodLoaded].sort(), ["event-flood-0", "event-flood-1"]);
+assert.ok([...eventFloodCounts.values()].every(count => count > 0));
+
 // The timer may enumerate many owner sockets. A per-owner gate alone would
 // still start one inventory and scheduler collector per owner at once; the
 // global cap keeps the next timer fire bounded while retaining owner
