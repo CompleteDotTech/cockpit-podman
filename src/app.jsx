@@ -345,6 +345,19 @@ class Application extends React.Component {
             return;
         }
 
+        const validInventory = containerList.filter(isContainerInventoryRow);
+        const invalidInventoryRow = validInventory.length !== containerList.length;
+        let schedulerPromise = null;
+        if (!invalidInventoryRow) {
+            const schedulerRequest = this.schedulerRequests.begin(con.uid);
+            // Scheduler metadata uses the inventory identity and can run
+            // independently while the bounded inspect workers collect the
+            // detailed health state. Both results carry the same owner and
+            // refresh generations, so a topology event discards stale output.
+            schedulerPromise = this.updateSchedulerCoverage(con, validInventory, schedulerRequest, request,
+                                                             HEALTH_SCHEDULER_TIMEOUT_MS);
+        }
+
         const results = await mapWithConcurrency(containerList, async container => {
             if (!isContainerInventoryRow(container))
                 return { container, error: new Error("Container inventory row is invalid") };
@@ -365,10 +378,8 @@ class Application extends React.Component {
 
         const snapshot = [];
         const errors = {};
-        let invalidInventoryRow = false;
         for (const result of results) {
             if (!isContainerInventoryRow(result.container)) {
-                invalidInventoryRow = true;
                 continue;
             }
             const id = result.container.Id;
@@ -452,15 +463,13 @@ class Application extends React.Component {
 
         if (!this.isCurrentConnection(con) || !this.healthRefreshGate.isCurrent(con.uid, request))
             return;
-        const schedulerRemaining = refreshDeadline - Date.now();
-        if (invalidInventoryRow || schedulerRemaining <= 0) {
+        if (invalidInventoryRow) {
             const schedulerRequest = this.schedulerRequests.begin(con.uid);
             this.applySchedulerCoverage(con, this.schedulerUid(con), snapshot, null,
                                         SCHEDULER_FAILURE, schedulerRequest);
             return;
         }
-        await this.updateSchedulerCoverage(con, snapshot, null, request,
-                                           Math.min(HEALTH_SCHEDULER_TIMEOUT_MS, schedulerRemaining));
+        await schedulerPromise;
     }
 
     schedulerErrorRecord(con, container, contextUid, reason) {
@@ -745,6 +754,16 @@ class Application extends React.Component {
                                                                            "Initial container inventory timed out");
             if (!Array.isArray(containerList))
                 throw new Error("container inventory is not an array");
+            const validInventory = containerList.filter(isContainerInventoryRow);
+            const invalidInventoryRow = validInventory.length !== containerList.length;
+            let schedulerPromise = null;
+            if (!invalidInventoryRow) {
+                // Start the bounded collector from the inventory snapshot;
+                // waiting for all inspect workers first used the whole refresh
+                // budget before scheduler metadata could run.
+                schedulerPromise = this.updateSchedulerCoverage(con, validInventory, request, refreshRequest,
+                                                                 HEALTH_SCHEDULER_TIMEOUT_MS);
+            }
             const results = await mapWithConcurrency(containerList, async container => {
                 if (!isContainerInventoryRow(container))
                     return { container, error: new Error("Container inventory row is invalid") };
@@ -764,7 +783,6 @@ class Application extends React.Component {
                 return;
 
             const validResults = results.filter(result => isContainerInventoryRow(result.container));
-            const invalidInventoryRow = validResults.length !== results.length;
             const schedulerContainers = validResults.map(result =>
                 isContainerInventoryRow(result.detail) ? result.detail : result.container);
             this.setState(prevState => {
@@ -852,14 +870,13 @@ class Application extends React.Component {
                 return { containers: copyContainers, containerErrors: copyContainerErrors, contextErrors, users };
             });
             this.updateContainerStats(con);
-            if (invalidInventoryRow || Date.now() >= deadline) {
+            if (invalidInventoryRow) {
                 const schedulerRequest = this.schedulerRequests.begin(con.uid);
                 this.applySchedulerCoverage(con, this.schedulerUid(con), schedulerContainers, null,
                                             SCHEDULER_FAILURE, schedulerRequest);
                 return;
             }
-            await this.updateSchedulerCoverage(con, schedulerContainers, request, refreshRequest,
-                                               Math.min(HEALTH_SCHEDULER_TIMEOUT_MS, deadline - Date.now()));
+            await schedulerPromise;
         } catch (error) {
             if (!this.isCurrentConnection(con))
                 return;

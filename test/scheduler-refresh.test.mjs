@@ -19,6 +19,27 @@ const statsQueueEnd = applicationSource.indexOf("\n    clearContainerStats", sta
 assert.ok(statsQueueStart >= 0 && statsQueueEnd > statsQueueStart);
 const statsQueueBody = applicationSource.slice(statsQueueStart, statsQueueEnd);
 assert.ok(statsQueueBody.startsWith("    queueContainerStats(con, stats) {\n        if (!this.isCurrentConnection(con))\n            return;"));
+
+// Scheduler metadata must start from the validated inventory snapshot before
+// the inspect fanout consumes the owner refresh window. The explicit request
+// arguments keep both concurrent results tied to the same generations.
+const ownerHealthStart = applicationSource.indexOf("    async collectOwnerHealth(con, request) {");
+const ownerHealthEnd = applicationSource.indexOf("\n    schedulerErrorRecord", ownerHealthStart);
+const ownerHealthBody = applicationSource.slice(ownerHealthStart, ownerHealthEnd);
+const ownerSchedulerStart = ownerHealthBody.indexOf("schedulerPromise = this.updateSchedulerCoverage");
+const ownerInspectStart = ownerHealthBody.indexOf("const results = await mapWithConcurrency");
+assert.ok(ownerSchedulerStart >= 0 && ownerSchedulerStart < ownerInspectStart);
+assert.match(ownerHealthBody.slice(ownerSchedulerStart, ownerInspectStart),
+             /schedulerRequest, request,[\s\S]*HEALTH_SCHEDULER_TIMEOUT_MS/);
+
+const initialHealthStart = applicationSource.indexOf("    async collectInitialContainers(con, refreshRequest) {");
+const initialHealthEnd = applicationSource.indexOf("\n    updateImages", initialHealthStart);
+const initialHealthBody = applicationSource.slice(initialHealthStart, initialHealthEnd);
+const initialSchedulerStart = initialHealthBody.indexOf("schedulerPromise = this.updateSchedulerCoverage");
+const initialInspectStart = initialHealthBody.indexOf("const results = await mapWithConcurrency");
+assert.ok(initialSchedulerStart >= 0 && initialSchedulerStart < initialInspectStart);
+assert.match(initialHealthBody.slice(initialSchedulerStart, initialInspectStart),
+             /request, refreshRequest,[\s\S]*HEALTH_SCHEDULER_TIMEOUT_MS/);
 const gate = new SchedulerRequestGate();
 const applied = [];
 
