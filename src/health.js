@@ -65,6 +65,25 @@ export const hasHealthCheck = container => {
 
 export const healthState = container => container?.State?.Health ?? container?.State?.Healthcheck ?? null;
 
+// An inspect response is the only source that can mark an inventory row's
+// health details as loaded.  Require the identity and the two top-level
+// inspect objects that the renderer consumes so a truthy but malformed API
+// reply cannot permanently turn a row into a false "loaded" state.
+export const isValidHealthDetails = (inventory, detail) => {
+    if (!inventory || typeof inventory.Id !== "string" || inventory.Id.length === 0 ||
+        !detail || typeof detail !== "object" || Array.isArray(detail) ||
+        detail.Id !== inventory.Id)
+        return false;
+
+    const state = detail.State;
+    if (!state || typeof state !== "object" || Array.isArray(state) ||
+        typeof state.Status !== "string" || state.Status.length === 0)
+        return false;
+
+    const config = detail.Config;
+    return Boolean(config && typeof config === "object" && !Array.isArray(config));
+};
+
 // Container inventory is intentionally cheaper than an inspect and is enough
 // to keep lifecycle rows current.  Once a full inspect has established that a
 // running container has no health check, repeating that inspect on every

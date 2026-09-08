@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { isValidHealthDetails } from "../src/health.js";
 import { KeyedRequestGate, mapWithConcurrency, OwnerRefreshGate, RequestConcurrencyGate, SchedulerRequestGate, withTimeout } from "../src/scheduler-request.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -31,6 +32,20 @@ const ownerInspectStart = ownerHealthBody.indexOf("const results = await mapWith
 assert.ok(ownerSchedulerStart >= 0 && ownerSchedulerStart < ownerInspectStart);
 assert.match(ownerHealthBody.slice(ownerSchedulerStart, ownerInspectStart),
              /schedulerRequest, request,[\s\S]*HEALTH_SCHEDULER_TIMEOUT_MS/);
+assert.match(ownerHealthBody, /result && !isValidHealthDetails\(inventory, result\.detail\)/);
+assert.match(ownerHealthBody, /errors\[key\] = CONTAINER_INSPECT_INVALID/);
+assert.match(ownerHealthBody, /failed\.healthDetailsLoaded = false/);
+assert.match(applicationSource, /if \(!isValidHealthDetails\(\{ Id: id \}, details\)\)/);
+
+// The owner refresh must classify null/undefined and malformed truthy detail
+// replies as collection failures, while a later exact inspect clears that
+// failure and is eligible to mark details loaded.
+const ownerInventory = { Id: "owner-refresh-container" };
+const validOwnerDetail = { Id: ownerInventory.Id, State: { Status: "running" }, Config: {} };
+for (const malformed of [null, undefined, { ...validOwnerDetail, Id: "other" },
+    { ...validOwnerDetail, State: {} }, { ...validOwnerDetail, Config: [] }])
+    assert.equal(isValidHealthDetails(ownerInventory, malformed), false);
+assert.equal(isValidHealthDetails(ownerInventory, validOwnerDetail), true);
 
 const initialHealthStart = applicationSource.indexOf("    async collectInitialContainers(con, refreshRequest) {");
 const initialHealthEnd = applicationSource.indexOf("\n    updateImages", initialHealthStart);

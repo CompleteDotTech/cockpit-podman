@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { healthAssessment, healthStates, shouldInspectHealth } from "../src/health.js";
+import { healthAssessment, healthStates, isValidHealthDetails, shouldInspectHealth } from "../src/health.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixtures = JSON.parse(await readFile(resolve(here, "browser-health-fixtures.json"), "utf8"));
@@ -40,6 +40,39 @@ assert.equal(healthAssessment({
     State: { Status: "running" },
     healthDetailsLoaded: false,
 }, now).reason, "details-pending");
+
+// A detail response can be truthy while still being unusable. It must carry
+// the exact inventory identity and the objects consumed by the row renderer;
+// otherwise collection must remain failed and the next refresh must retry it.
+const inspectInventory = { Id: "inspect-owner-container" };
+const inspectDetail = {
+    Id: inspectInventory.Id,
+    State: { Status: "running" },
+    Config: {},
+};
+assert.equal(isValidHealthDetails(inspectInventory, inspectDetail), true);
+for (const [label, malformed] of [
+    ["null detail", null],
+    ["undefined detail", undefined],
+    ["truthy scalar", "inspect failed"],
+    ["mismatched id", { ...inspectDetail, Id: "different-container" }],
+    ["missing state", { ...inspectDetail, State: undefined }],
+    ["malformed state", { ...inspectDetail, State: "running" }],
+    ["missing state status", { ...inspectDetail, State: {} }],
+    ["missing config", { ...inspectDetail, Config: undefined }],
+    ["malformed config", { ...inspectDetail, Config: [] }],
+])
+    assert.equal(isValidHealthDetails(inspectInventory, malformed), false, label);
+
+const failedInspectRow = { ...inspectInventory, State: { Status: "running" }, healthDetailsLoaded: false };
+assert.equal(healthAssessment(failedInspectRow, now, "Container inspect response is invalid").status,
+             healthStates.error);
+const recoveredInspect = structuredClone(fixtures.healthy.container);
+recoveredInspect.Id = inspectInventory.Id;
+recoveredInspect.healthDetailsLoaded = true;
+assert.equal(isValidHealthDetails(inspectInventory, recoveredInspect), true);
+assert.equal(healthAssessment(recoveredInspect, now, null, fixtures.healthy.scheduler).status,
+             healthStates.healthy);
 
 assert.equal(healthAssessment({
     Id: "partial-health-config",

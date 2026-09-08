@@ -27,7 +27,7 @@ import detect_quadlets from './detect-quadlets.py';
 import scheduler_collector from './health-scheduler.py';
 import rest from './rest.js';
 import { KeyedRequestGate, mapWithConcurrency, OwnerRefreshGate, RequestConcurrencyGate, SchedulerRequestGate, withTimeout } from './scheduler-request.js';
-import { shouldInspectHealth } from './health.js';
+import { isValidHealthDetails, shouldInspectHealth } from './health.js';
 import { makeKey, WithPodmanInfo, debug } from './util.js';
 
 const _ = cockpit.gettext;
@@ -44,6 +44,7 @@ const HEALTH_INSPECT_TIMEOUT_MS = 5000;
 const HEALTH_EVENT_INSPECT_TIMEOUT_MS = 5000;
 const HEALTH_INSPECT_CONCURRENCY = 8;
 const HEALTH_SCHEDULER_TIMEOUT_MS = 8000;
+const CONTAINER_INSPECT_INVALID = "Container inspect response is invalid";
 // Stats are streamed independently for every owner. Coalesce a burst into a
 // single render while keeping the displayed values boundedly fresh.
 const CONTAINER_STATS_FLUSH_INTERVAL_MS = 100;
@@ -476,8 +477,16 @@ class Application extends React.Component {
             const result = resultByKey.get(key);
             if (result?.error) {
                 const old = this.state.containers?.[key] || null;
-                snapshot.push(containerFromInventory(inventory, con.uid, key, old));
+                const failed = containerFromInventory(inventory, con.uid, key, old);
+                failed.healthDetailsLoaded = false;
+                snapshot.push(failed);
                 errors[key] = errorText(result.error);
+            } else if (result && !isValidHealthDetails(inventory, result.detail)) {
+                const old = this.state.containers?.[key] || null;
+                const failed = containerFromInventory(inventory, con.uid, key, old);
+                failed.healthDetailsLoaded = false;
+                snapshot.push(failed);
+                errors[key] = CONTAINER_INSPECT_INVALID;
             } else if (result?.detail) {
                 const detail = { ...result.detail, uid: con.uid, key };
                 detail.healthDetailsLoaded = true;
@@ -1031,8 +1040,16 @@ class Application extends React.Component {
                                                     "Container event inspect timed out");
         })
                 .then(details => {
-                    if (!details || !this.isCurrentConnection(con) || !this.containerEventRequests.isCurrent(key, request))
+                    if (!this.isCurrentConnection(con) || !this.containerEventRequests.isCurrent(key, request))
                         return;
+                    if (!isValidHealthDetails({ Id: id }, details)) {
+                        this.setState(prevState => {
+                            if (!this.isCurrentConnection(con) || !this.containerEventRequests.isCurrent(key, request))
+                                return null;
+                            return { containerErrors: { ...prevState.containerErrors, [key]: CONTAINER_INSPECT_INVALID } };
+                        });
+                        return;
+                    }
                     details.uid = con.uid;
                     details.key = key;
                     details.healthDetailsLoaded = true;
