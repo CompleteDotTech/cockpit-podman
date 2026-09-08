@@ -353,6 +353,8 @@ const health_reason = (assessment) => {
     case healthStates.error:
         return assessment.reason === "scheduler-error"
             ? _("Health scheduler metadata is unavailable")
+            : assessment.reason === "collection-timeout"
+                ? _("Health data collection timed out")
             : _("Health data collection failed");
     case healthStates.stopped:
         return _("Container is stopped; health result is not live");
@@ -627,9 +629,10 @@ class Containers extends React.Component {
             props: {
                 key: container.key,
                 "data-row-id": container.key,
+                "data-row-type": container.IsQuadlet ? "quadlet" : "container",
                 "data-started-at": container.State?.StartedAt,
                 "data-owner-uid": container.uid ?? "user",
-                "data-container-id": container.Id,
+                ...(container.IsQuadlet ? { "data-quadlet-id": container.Id } : { "data-container-id": container.Id }),
                 "data-health-status": assessment.status,
                 "data-health-last-checked": assessment.lastChecked === null ? "" : assessment.lastChecked,
                 "data-row-name": `${container.uid === null ? 'user' : container.uid}-${container.Name}`

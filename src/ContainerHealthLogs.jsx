@@ -62,6 +62,8 @@ const ContainerHealthLogs = ({ con, container, onAddNotification, state, assessm
         case "error":
             return assessment.reason === "scheduler-error"
                 ? _("Health scheduler metadata is unavailable")
+                : assessment.reason === "collection-timeout"
+                    ? _("Health data collection timed out")
                 : _("Health data collection failed");
         case "stopped":
             return _("Container is stopped; health result is not live");

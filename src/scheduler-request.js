@@ -104,6 +104,245 @@ export class OwnerRefreshGate extends SchedulerRequestGate {
     }
 }
 
+// Bound requests on a shared Podman HTTP connection.  Cockpit's HTTP helper
+// queues requests internally, so launching an inspect for every event can
+// leave timed-out work occupying the connection long after the caller has
+// moved on.  A queued entry is cancellable before it starts; an active entry
+// forwards cancellation to the close() hook preserved by rest.ts.
+export class RequestConcurrencyGate {
+    constructor(maxConcurrent = 8) {
+        this.maxConcurrent = Number.isInteger(maxConcurrent) && maxConcurrent > 0
+            ? maxConcurrent
+            : 1;
+        this.active = 0;
+        this.pending = [];
+    }
+
+    run(operation) {
+        let resolveEntry;
+        let rejectEntry;
+        let resolveStarted;
+        const promise = new Promise((resolve, reject) => {
+            resolveEntry = resolve;
+            rejectEntry = reject;
+        });
+        const started = new Promise(resolve => {
+            resolveStarted = resolve;
+        });
+        promise.started = started;
+        const entry = {
+            operation,
+            promise,
+            resolve: resolveEntry,
+            reject: rejectEntry,
+            request: null,
+            started: false,
+            settled: false,
+            resolveStarted,
+        };
+        promise.close = (problem = "cancelled") => {
+            if (entry.settled)
+                return;
+            if (!entry.started) {
+                const index = this.pending.indexOf(entry);
+                if (index !== -1)
+                    this.pending.splice(index, 1);
+                entry.settled = true;
+                entry.resolveStarted(false);
+                entry.reject(new Error(problem));
+                return;
+            }
+            entry.settled = true;
+            entry.request?.close?.(problem);
+            entry.reject(new Error(problem));
+        };
+        this.pending.push(entry);
+        this.drain();
+        return promise;
+    }
+
+    drain() {
+        while (this.active < this.maxConcurrent && this.pending.length > 0) {
+            const entry = this.pending.shift();
+            if (entry.settled)
+                continue;
+            entry.started = true;
+            this.active++;
+            let request;
+            try {
+                request = entry.operation();
+                entry.request = request;
+                entry.resolveStarted(true);
+            } catch (error) {
+                entry.settled = true;
+                entry.resolveStarted(false);
+                entry.reject(error);
+            }
+            if (request === undefined) {
+                entry.settled = true;
+                entry.resolve(undefined);
+                this.finish(entry);
+            } else
+                Promise.resolve(request)
+                        .then(value => {
+                            if (!entry.settled) {
+                                entry.settled = true;
+                                entry.resolve(value);
+                            }
+                        }, error => {
+                            if (!entry.settled) {
+                                entry.settled = true;
+                                entry.reject(error);
+                            }
+                        })
+                        .finally(() => this.finish(entry));
+        }
+    }
+
+    finish(entry) {
+        if (!entry.started)
+            return;
+        entry.started = false;
+        this.active--;
+        this.drain();
+    }
+}
+
+// Serialize requests for one container identity while allowing different
+// containers to use the global request budget.  A newer generation replaces
+// only an older queued request; an already running request is allowed to
+// settle before the latest request starts.
+export class KeyedRequestGate {
+    constructor(run) {
+        this.runRequest = run;
+        this.states = new Map();
+    }
+
+    request(key, metadata, operation, canReuse) {
+        let state = this.states.get(key);
+        if (!state) {
+            state = { active: null, queued: null };
+            this.states.set(key, state);
+        }
+        if (state.active && canReuse(state.active.metadata))
+            return state.active.promise;
+        if (state.queued && canReuse(state.queued.metadata))
+            return state.queued.promise;
+
+        if (state.queued)
+            state.queued.promise.close("superseded");
+
+        let resolveEntry;
+        let rejectEntry;
+        const promise = new Promise((resolve, reject) => {
+            resolveEntry = resolve;
+            rejectEntry = reject;
+        });
+        const entry = {
+            key,
+            metadata,
+            operation,
+            promise,
+            resolve: resolveEntry,
+            reject: rejectEntry,
+            request: null,
+            started: false,
+            settled: false,
+        };
+        const started = new Promise(resolve => {
+            entry.resolveStarted = resolve;
+        });
+        promise.started = started;
+        promise.close = (problem = "cancelled") => {
+            if (entry.settled)
+                return;
+            if (!entry.started) {
+                if (state.queued === entry)
+                    state.queued = null;
+                entry.settled = true;
+                entry.resolveStarted(false);
+                entry.reject(new Error(problem));
+                this.cleanup(key, state);
+                return;
+            }
+            entry.settled = true;
+            entry.request?.close?.(problem);
+            entry.reject(new Error(problem));
+        };
+
+        if (state.active)
+            state.queued = entry;
+        else
+            this.start(key, state, entry);
+        return promise;
+    }
+
+    start(key, state, entry) {
+        entry.started = true;
+        state.active = entry;
+        let request;
+        try {
+            request = this.runRequest(entry.operation);
+            entry.request = request;
+            if (request?.started)
+                request.started.then(entry.resolveStarted);
+            else
+                entry.resolveStarted(true);
+        } catch (error) {
+            entry.settled = true;
+            entry.resolveStarted(false);
+            entry.reject(error);
+        }
+        if (request === undefined) {
+            if (!entry.settled) {
+                entry.settled = true;
+                entry.resolve(undefined);
+            }
+            this.finish(key, state, entry);
+            return;
+        }
+        Promise.resolve(request)
+                .then(value => {
+                    if (!entry.settled) {
+                        entry.settled = true;
+                        entry.resolve(value);
+                    }
+                }, error => {
+                    if (!entry.settled) {
+                        entry.settled = true;
+                        entry.reject(error);
+                    }
+                })
+                .finally(() => this.finish(key, state, entry));
+    }
+
+    finish(key, state, entry) {
+        if (state.active !== entry)
+            return;
+        state.active = null;
+        const next = state.queued;
+        state.queued = null;
+        if (next)
+            this.start(key, state, next);
+        else
+            this.cleanup(key, state);
+    }
+
+    cleanup(key, state) {
+        if (!state.active && !state.queued && this.states.get(key) === state)
+            this.states.delete(key);
+    }
+
+    closeWhere(predicate, problem = "cancelled") {
+        for (const state of this.states.values()) {
+            if (state.active && predicate(state.active.metadata))
+                state.active.promise.close(problem);
+            if (state.queued && predicate(state.queued.metadata))
+                state.queued.promise.close(problem);
+        }
+    }
+}
+
 export const withTimeout = (promise, timeoutMs, message, onTimeout = null) => {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
         return Promise.reject(new Error(message));

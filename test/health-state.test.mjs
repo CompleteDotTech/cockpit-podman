@@ -62,6 +62,10 @@ const sanitized = healthAssessment(fixtures["collector-error"].container, now, f
 assert.equal(sanitized.status, healthStates.error);
 assert.equal(sanitized.error, "health-collection-failed");
 assert.doesNotMatch(sanitized.error, /podman\.sock|secret|token|https?:\/\//i);
+const timedOut = healthAssessment(fixtures["collector-error"].container, now, "Container inspect timed out", fixtures["collector-error"].scheduler);
+assert.equal(timedOut.status, healthStates.error);
+assert.equal(timedOut.reason, "collection-timeout");
+assert.equal(timedOut.error, "health-collection-timeout");
 
 const schedulerSecret = healthAssessment(fixtures.healthy.container, now, null, {
     coverage_status: "error",
@@ -120,6 +124,8 @@ assert.equal(healthAssessment(fixtures.healthy.container, now, recreated.old.err
 assert.equal(healthAssessment(fixtures.healthy.container, now, recreated.new.error, fixtures.healthy.scheduler).status, healthStates.healthy);
 
 assert.equal(healthAssessment(fixtures.stopped.container, now, null, fixtures.stopped.scheduler).status, healthStates.stopped);
+assert.equal(healthAssessment(fixtures.stopped.container, now, "inventory refresh timed out", fixtures.stopped.scheduler).status,
+             healthStates.stopped);
 
 // An exit code of zero is not sufficient to call an arbitrary workload a
 // completed one-shot job.  Without explicit metadata it remains stopped.
@@ -130,6 +136,8 @@ assert.equal(healthAssessment(exitedSuccessfully, now, null, fixtures.stopped.sc
 const completedOneShot = structuredClone(exitedSuccessfully);
 completedOneShot.Config.Labels = { "com.docker.compose.oneoff": "True" };
 assert.equal(healthAssessment(completedOneShot, now, null, fixtures.stopped.scheduler).status, healthStates.completed);
+assert.equal(healthAssessment(completedOneShot, now, "inventory refresh timed out", fixtures.stopped.scheduler).status,
+             healthStates.completed);
 
 const explicitStateOneShot = structuredClone(exitedSuccessfully);
 explicitStateOneShot.State.OneShot = true;

@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { mapWithConcurrency, OwnerRefreshGate, SchedulerRequestGate, withTimeout } from "../src/scheduler-request.js";
+import { KeyedRequestGate, mapWithConcurrency, OwnerRefreshGate, RequestConcurrencyGate, SchedulerRequestGate, withTimeout } from "../src/scheduler-request.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = JSON.parse(await readFile(resolve(here, "scheduler-refresh-fixture.json"), "utf8"));
@@ -300,6 +300,73 @@ const queuedOwner = queuedGate.start("queued-owner", async () => {
 const waitingOwner = queuedGate.start("waiting-owner", async () => undefined);
 assert.equal(queuedGate.start("waiting-owner", async () => undefined), waitingOwner);
 await Promise.all([queuedOwner.promise, waitingOwner.promise]);
+
+// Shared Podman HTTP calls have a global cap, and a timeout must remove a
+// queued call before it can start later and re-saturate the connection.
+const requestGate = new RequestConcurrencyGate(1);
+let requestStarts = 0;
+const heldRequest = requestGate.run(async () => {
+    requestStarts++;
+    await new Promise(resolveResponse => setTimeout(resolveResponse, 4));
+});
+const canceledRequest = requestGate.run(async () => {
+    requestStarts++;
+});
+canceledRequest.close("timeout");
+await assert.rejects(canceledRequest, /timeout/);
+await heldRequest;
+assert.equal(requestStarts, 1);
+
+const activeRequestGate = new RequestConcurrencyGate(1);
+let activeClosed = false;
+const activeCancellable = activeRequestGate.run(() => {
+    const request = new Promise(() => {});
+    request.close = () => { activeClosed = true; };
+    return request;
+});
+activeCancellable.close("timeout");
+await assert.rejects(activeCancellable, /timeout/);
+assert.equal(activeClosed, true);
+
+// A container event must not reuse an inspect that began before that event,
+// and a reconnect with the same UID must not reuse the old connection's
+// promise. Newer requests wait behind a running request for that ID.
+const keyedRuns = [];
+const keyedGate = new KeyedRequestGate(operation => operation());
+const firstConnection = {};
+const secondConnection = {};
+const keyedRequest = (con, generation, value) => keyedGate.request(
+    "owner-container",
+    { con, generation },
+    async () => {
+        keyedRuns.push(value);
+        await new Promise(resolveResponse => setTimeout(resolveResponse, 2));
+        return value;
+    },
+    metadata => metadata.con === con && metadata.generation === generation,
+);
+const preEvent = keyedRequest(firstConnection, 0, "pre-event");
+const eventRefresh = keyedRequest(firstConnection, 1, "event");
+assert.notEqual(preEvent, eventRefresh);
+assert.equal(await preEvent, "pre-event");
+assert.equal(await eventRefresh, "event");
+const reconnectRefresh = keyedRequest(secondConnection, 0, "reconnect");
+assert.notEqual(reconnectRefresh, eventRefresh);
+assert.equal(await reconnectRefresh, "reconnect");
+assert.deepEqual(keyedRuns, ["pre-event", "event", "reconnect"]);
+
+const capacityGate = new RequestConcurrencyGate(8);
+let activeRequests = 0;
+let maxActiveRequests = 0;
+const capacityRuns = Array.from({ length: 156 }, (_, index) => capacityGate.run(async () => {
+    activeRequests++;
+    maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+    await new Promise(resolveResponse => setTimeout(resolveResponse, index % 3));
+    activeRequests--;
+    return index;
+}));
+assert.deepEqual(await Promise.all(capacityRuns), Array.from({ length: 156 }, (_, index) => index));
+assert.ok(maxActiveRequests <= 8);
 
 let activeWorkers = 0;
 let maxWorkers = 0;

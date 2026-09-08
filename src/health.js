@@ -23,6 +23,7 @@ export const healthStates = Object.freeze({
 // existing health-log detail view remains the place for an operator who has
 // deliberately opened the raw Podman log.
 const HEALTH_COLLECTION_ERROR = "health-collection-failed";
+const HEALTH_COLLECTION_TIMEOUT = "health-collection-timeout";
 const SCHEDULER_ERROR = "scheduler-metadata-unavailable";
 
 const durationToMilliseconds = duration => {
@@ -226,6 +227,11 @@ const schedulerFreshness = (config, scheduler) => {
     };
 };
 
+const collectionReason = error => typeof error === "string" &&
+    /\b(?:timed?\s*out|timeout)\b/i.test(error)
+    ? "collection-timeout"
+    : "collection-error";
+
 export const staleAfter = (config, _state, scheduler = null) => schedulerFreshness(config, scheduler).staleAfterMs;
 
 export const healthAssessment = (container, now = Date.now(), collectionError = null, scheduler = null) => {
@@ -254,14 +260,6 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
         ...extra,
     });
 
-    if (collectionError) {
-        return base({
-            status: healthStates.error,
-            reason: "collection-error",
-            error: HEALTH_COLLECTION_ERROR,
-        });
-    }
-
     const lifecycle = String(container?.State?.Status || "").toLowerCase();
     if (lifecycle && lifecycle !== "running") {
         const completed = lifecycle === "exited" && Number(container?.State?.ExitCode) === 0 &&
@@ -269,6 +267,18 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
         return base({
             status: completed ? healthStates.completed : healthStates.stopped,
             reason: completed ? "completed" : "stopped",
+        });
+    }
+
+    // A stopped or completed container has no live health result to collect.
+    // Owner-wide refresh failures must not overwrite that lifecycle state.
+    if (collectionError) {
+        return base({
+            status: healthStates.error,
+            reason: collectionReason(collectionError),
+            error: collectionReason(collectionError) === "collection-timeout"
+                ? HEALTH_COLLECTION_TIMEOUT
+                : HEALTH_COLLECTION_ERROR,
         });
     }
 

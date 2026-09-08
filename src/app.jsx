@@ -26,7 +26,7 @@ import * as client from './client.js';
 import detect_quadlets from './detect-quadlets.py';
 import scheduler_collector from './health-scheduler.py';
 import rest from './rest.js';
-import { mapWithConcurrency, OwnerRefreshGate, SchedulerRequestGate, withTimeout } from './scheduler-request.js';
+import { KeyedRequestGate, mapWithConcurrency, OwnerRefreshGate, RequestConcurrencyGate, SchedulerRequestGate, withTimeout } from './scheduler-request.js';
 import { makeKey, WithPodmanInfo, debug } from './util.js';
 
 const _ = cockpit.gettext;
@@ -114,6 +114,11 @@ class Application extends React.Component {
         this.containerEventRequests = new SchedulerRequestGate();
         this.schedulerRequests = new SchedulerRequestGate();
         this.healthRefreshGate = new OwnerRefreshGate();
+        // Keep all owner refreshes and event-driven inspects within one
+        // bounded Podman HTTP request pool. Per-request deadlines start when
+        // a queued request actually reaches the transport.
+        this.containerRequestGate = new RequestConcurrencyGate(HEALTH_INSPECT_CONCURRENCY);
+        this.containerInspectRequests = new KeyedRequestGate(operation => this.containerRequestGate.run(operation));
         this.ownerConnections = new Map();
         this.healthRefreshTimer = null;
         this.sessionUser = null;
@@ -224,6 +229,13 @@ class Application extends React.Component {
             if (key.startsWith(ownerPrefix))
                 this.containerEventRequests.begin(key);
         }
+        for (const key of Object.keys(this.pendingUpdateContainer)) {
+            if (key.startsWith(ownerPrefix))
+                delete this.pendingUpdateContainer[key];
+        }
+        this.containerInspectRequests.closeWhere(metadata => metadata.con === con ||
+                                                        (typeof con !== "object" && metadata.con.uid === uid),
+                                                        "owner-disconnected");
         if (typeof con === "object" && this.ownerConnections.get(uid) === con)
             this.ownerConnections.delete(uid);
         return true;
@@ -242,6 +254,35 @@ class Application extends React.Component {
             console.warn("periodic health refresh failed", { uid: con.uid, stage: "health-refresh", error: error?.message || "unknown" });
             this.markOwnerHealthUnavailable(con, entry.request, error);
         });
+    }
+
+    inspectContainer(con, id) {
+        const key = makeKey(con.uid, id);
+        const generation = this.containerEventGenerations.get(key) || 0;
+        return this.containerInspectRequests.request(
+            key,
+            { con, generation },
+            () => client.inspectContainer(con, id),
+            metadata => metadata.con === con && metadata.generation === generation,
+        );
+    }
+
+    getContainerInventory(con) {
+        return this.containerRequestGate.run(() => client.getContainers(con));
+    }
+
+    async withContainerRequestTimeout(request, timeoutMs, message) {
+        const startedAt = Date.now();
+        if (request.started) {
+            const started = await withTimeout(request.started, timeoutMs, message,
+                                               () => request.close?.("timeout"));
+            if (!started)
+                throw new Error(message);
+        }
+        return withTimeout(request,
+                           Math.max(1, timeoutMs - (Date.now() - startedAt)),
+                           message,
+                           () => request.close?.("timeout"));
     }
 
     markOwnerHealthUnavailable(con, refreshRequest, error) {
@@ -282,9 +323,10 @@ class Application extends React.Component {
         }
         let containerList;
         try {
-            containerList = await withTimeout(client.getContainers(con),
-                                              Math.max(1, refreshDeadline - Date.now()),
-                                              "Container inventory refresh timed out");
+            const inventoryRequest = this.getContainerInventory(con);
+            containerList = await this.withContainerRequestTimeout(inventoryRequest,
+                                                                    Math.max(1, refreshDeadline - Date.now()),
+                                                                    "Container inventory refresh timed out");
             if (!Array.isArray(containerList))
                 throw new Error("container inventory is not an array");
         } catch (error) {
@@ -299,8 +341,9 @@ class Application extends React.Component {
             if (remaining <= 0)
                 return { container, error: new Error("Container health refresh timed out") };
             try {
-                const detail = await withTimeout(client.inspectContainer(con, container.Id), remaining,
-                                                 "Container inspect timed out");
+                const inspectRequest = this.inspectContainer(con, container.Id);
+                const detail = await this.withContainerRequestTimeout(inspectRequest, remaining,
+                                                                       "Container inspect timed out");
                 return { container, detail };
             } catch (error) {
                 return { container, error };
@@ -617,8 +660,10 @@ class Application extends React.Component {
             }
         }
         try {
-            const containerList = await withTimeout(client.getContainers(con), Math.max(1, deadline - Date.now()),
-                                                     "Initial container inventory timed out");
+            const inventoryRequest = this.getContainerInventory(con);
+            const containerList = await this.withContainerRequestTimeout(inventoryRequest,
+                                                                           Math.max(1, deadline - Date.now()),
+                                                                           "Initial container inventory timed out");
             if (!Array.isArray(containerList))
                 throw new Error("container inventory is not an array");
             const results = await mapWithConcurrency(containerList, async container => {
@@ -628,8 +673,9 @@ class Application extends React.Component {
                 if (remaining <= 0)
                     return { container, error: new Error("Initial container inspect timed out") };
                 try {
-                    const detail = await withTimeout(client.inspectContainer(con, container.Id), remaining,
-                                                     "Initial container inspect timed out");
+                    const inspectRequest = this.inspectContainer(con, container.Id);
+                    const detail = await this.withContainerRequestTimeout(inspectRequest, remaining,
+                                                                          "Initial container inspect timed out");
                     return { container, detail };
                 } catch (error) {
                     return { container, error };
@@ -825,11 +871,19 @@ class Application extends React.Component {
          * This messes up the state. So we need to serialize them for a particular container. */
         const wait = this.pendingUpdateContainer[key] ?? Promise.resolve();
 
-        const new_wait = wait.then(() => withTimeout(client.inspectContainer(con, id),
-                                                     HEALTH_EVENT_INSPECT_TIMEOUT_MS,
-                                                     "Container event inspect timed out"))
+        const new_wait = wait.catch(() => undefined).then(() => {
+            // A newer event may have arrived while this container's previous
+            // inspect was queued. Do not spend another global request slot on
+            // an event whose result is already obsolete.
+            if (!this.isCurrentConnection(con) || !this.containerEventRequests.isCurrent(key, request))
+                return;
+            const inspectRequest = this.inspectContainer(con, id);
+            return this.withContainerRequestTimeout(inspectRequest,
+                                                    HEALTH_EVENT_INSPECT_TIMEOUT_MS,
+                                                    "Container event inspect timed out");
+        })
                 .then(details => {
-                    if (!this.isCurrentConnection(con) || !this.containerEventRequests.isCurrent(key, request))
+                    if (!details || !this.isCurrentConnection(con) || !this.containerEventRequests.isCurrent(key, request))
                         return;
                     details.uid = con.uid;
                     details.key = key;
@@ -1177,6 +1231,9 @@ class Application extends React.Component {
                     uid: con.uid,
                     key: container_key,
                     Id: key,
+                    // This is a display-only row synthesized from a systemd
+                    // unit; it does not have a Podman container ID.
+                    IsQuadlet: true,
                     IsService: false,
                     IsInfra: false,
                     Name: quadlet.name,
