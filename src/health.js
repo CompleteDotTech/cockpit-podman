@@ -65,6 +65,27 @@ export const hasHealthCheck = container => {
 
 export const healthState = container => container?.State?.Health ?? container?.State?.Healthcheck ?? null;
 
+// Container inventory is intentionally cheaper than an inspect and is enough
+// to keep lifecycle rows current.  Once a full inspect has established that a
+// running container has no health check, repeating that inspect on every
+// refresh only adds load and can starve the configured checks before their
+// freshness window expires.  Keep full detail requests for pending rows and
+// rows with a configured check; stopped/completed rows are explained by their
+// lifecycle alone.
+export const shouldInspectHealth = (inventory, current = null) => {
+    const inventoryState = typeof inventory?.State === "string"
+        ? inventory.State
+        : inventory?.State?.Status;
+    const currentState = current?.State?.Status;
+    const lifecycle = String(inventoryState || currentState || "").toLowerCase();
+    if (lifecycle && lifecycle !== "running")
+        return false;
+
+    if (!current || current.healthDetailsLoaded !== true)
+        return true;
+    return hasHealthCheck(current);
+};
+
 export const healthLogTime = log => timestampToMilliseconds(log?.End) ?? timestampToMilliseconds(log?.Start);
 
 export const lastHealthCheck = state => {
@@ -279,6 +300,16 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
             error: collectionReason(collectionError) === "collection-timeout"
                 ? HEALTH_COLLECTION_TIMEOUT
                 : HEALTH_COLLECTION_ERROR,
+        });
+    }
+
+    // Inventory rows are rendered before their optional inspect payload. Do
+    // not infer a missing check from the absence of Config while that detail
+    // request is still pending.
+    if (container?.healthDetailsLoaded === false) {
+        return base({
+            status: healthStates.starting,
+            reason: "details-pending",
         });
     }
 

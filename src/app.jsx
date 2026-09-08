@@ -27,6 +27,7 @@ import detect_quadlets from './detect-quadlets.py';
 import scheduler_collector from './health-scheduler.py';
 import rest from './rest.js';
 import { KeyedRequestGate, mapWithConcurrency, OwnerRefreshGate, RequestConcurrencyGate, SchedulerRequestGate, withTimeout } from './scheduler-request.js';
+import { shouldInspectHealth } from './health.js';
 import { makeKey, WithPodmanInfo, debug } from './util.js';
 
 const _ = cockpit.gettext;
@@ -50,6 +51,53 @@ const CONTAINER_STATS_FLUSH_INTERVAL_MS = 100;
 const isContainerInventoryRow = container => container !== null &&
     typeof container === "object" && !Array.isArray(container) &&
     typeof container.Id === "string" && container.Id.trim().length > 0;
+
+const containerFromInventory = (inventory, uid, key, current = null) => {
+    const inventoryState = typeof inventory?.State === "string"
+        ? { Status: inventory.State.toLowerCase() }
+        : (inventory?.State || {});
+    const state = {
+        ...(current?.State || {}),
+        ...inventoryState,
+    };
+    const id = inventory.Id;
+    const name = inventory.Names?.[0]?.replace(/^\//, "") || inventory.Name || current?.Name || id;
+    const inventoryConfig = inventory.Config || {};
+    const currentConfig = current?.Config || {};
+    const config = {
+        ...inventoryConfig,
+        ...currentConfig,
+        Labels: {
+            ...(inventory.Labels || {}),
+            ...(inventoryConfig.Labels || {}),
+            ...(currentConfig.Labels || {}),
+        },
+        Env: currentConfig.Env || inventoryConfig.Env || inventory.Env || [],
+        Cmd: currentConfig.Cmd || inventoryConfig.Cmd || inventory.Command || [],
+    };
+    const networkSettings = {
+        ...(inventory.NetworkSettings || {}),
+        ...(current?.NetworkSettings || {}),
+        Ports: current?.NetworkSettings?.Ports || inventory.NetworkSettings?.Ports || {},
+    };
+    return {
+        ...inventory,
+        ...(current || {}),
+        Id: id,
+        Name: name,
+        ImageName: inventory.ImageName || inventory.Image || current?.ImageName || current?.Image || id,
+        Config: config,
+        NetworkSettings: networkSettings,
+        Mounts: current?.Mounts || inventory.Mounts || [],
+        State: state,
+        uid,
+        key,
+        // An inventory-only row has enough data for lifecycle rendering but
+        // must remain pending until its first full inspect establishes health
+        // configuration and the native result.
+        healthDetailsLoaded: current?.healthDetailsLoaded === true,
+    };
+};
 
 // sort order of "users" state for dialogs: system, session user, then other users by ascending name
 function compareUser(a, b) {
@@ -117,6 +165,11 @@ class Application extends React.Component {
         this.containerEventRequests = new SchedulerRequestGate();
         this.schedulerRequests = new SchedulerRequestGate();
         this.healthRefreshGate = new OwnerRefreshGate();
+        // A timer tick that lands during a running refresh must result in one
+        // follow-up pass. OwnerRefreshGate coalesces that tick by design, so
+        // retain the request here instead of allowing a slow owner to miss a
+        // polling interval indefinitely.
+        this.healthRefreshFollowups = new Map();
         // Keep all owner refreshes and event-driven inspects within one
         // bounded Podman HTTP request pool. Per-request deadlines start when
         // a queued request actually reaches the transport.
@@ -221,6 +274,7 @@ class Application extends React.Component {
         const uid = typeof con === "object" ? con.uid : con;
         if (typeof con === "object" && this.ownerConnections.get(uid) !== con)
             return false;
+        this.healthRefreshFollowups.delete(uid === null ? "user" : String(uid));
         this.healthRefreshGate.invalidate(uid);
         this.schedulerRequests.begin(uid);
         const ownerPrefix = `${uid ?? "user"}-`;
@@ -254,10 +308,30 @@ class Application extends React.Component {
     }
 
     refreshOwnerHealth(con) {
+        const ownerKey = con.uid === null ? "user" : String(con.uid);
+        const running = this.healthRefreshGate.running.get(ownerKey);
         const entry = this.healthRefreshGate.start(con.uid, request => this.collectOwnerHealth(con, request));
+        if (running && entry === running)
+            this.healthRefreshFollowups.set(ownerKey, con);
+        else
+            // A new or queued entry is itself the requested follow-up.
+            this.healthRefreshFollowups.delete(ownerKey);
+
         return entry.promise.catch(error => {
             console.warn("periodic health refresh failed", { uid: con.uid, stage: "health-refresh", error: error?.message || "unknown" });
             this.markOwnerHealthUnavailable(con, entry.request, error);
+        }).finally(() => {
+            if (this.healthRefreshFollowups.get(ownerKey) !== con)
+                return;
+            this.healthRefreshFollowups.delete(ownerKey);
+            // Let OwnerRefreshGate remove the completed entry before starting
+            // the guaranteed follow-up; otherwise start() would coalesce it
+            // back onto the just-finished promise.
+            setTimeout(() => {
+                if (this.isCurrentConnection(con) &&
+                    this.state.users.find(user => user.uid === con.uid)?.containersLoaded)
+                    this.refreshOwnerHealth(con);
+            }, 0);
         });
     }
 
@@ -358,7 +432,16 @@ class Application extends React.Component {
                                                              HEALTH_SCHEDULER_TIMEOUT_MS);
         }
 
-        const results = await mapWithConcurrency(containerList, async container => {
+        // The inventory response is sufficient for lifecycle and identity
+        // updates.  A full inspect is reserved for running rows whose health
+        // details are pending or configured; rows already known to have no
+        // check, and every stopped/completed row, can be rendered without
+        // another expensive request.
+        const inspectList = validInventory.filter(container => {
+            const key = makeKey(con.uid, container.Id);
+            return shouldInspectHealth(container, this.state.containers?.[key]);
+        });
+        const results = await mapWithConcurrency(inspectList, async container => {
             if (!isContainerInventoryRow(container))
                 return { container, error: new Error("Container inventory row is invalid") };
             const remaining = Math.min(HEALTH_INSPECT_TIMEOUT_MS, refreshDeadline - Date.now());
@@ -376,30 +459,32 @@ class Application extends React.Component {
         if (!this.isCurrentConnection(con) || !this.healthRefreshGate.isCurrent(con.uid, request))
             return;
 
+        const resultByKey = new Map();
+        for (const result of results) {
+            if (isContainerInventoryRow(result.container))
+                resultByKey.set(makeKey(con.uid, result.container.Id), result);
+        }
+
         const snapshot = [];
         const errors = {};
-        for (const result of results) {
-            if (!isContainerInventoryRow(result.container)) {
+        for (const inventory of containerList) {
+            if (!isContainerInventoryRow(inventory)) {
                 continue;
             }
-            const id = result.container.Id;
+            const id = inventory.Id;
             const key = makeKey(con.uid, id);
-            if (result.error) {
-                const old = this.state.containers?.[key];
-                snapshot.push(old || {
-                    ...result.container,
-                    Id: id,
-                    Name: result.container.Names?.[0]?.replace(/^\//, "") || id,
-                    ImageName: result.container.ImageName || result.container.Image,
-                    Config: result.container.Config || {},
-                    State: { Status: String(result.container.State || "").toLowerCase() },
-                    uid: con.uid,
-                    key,
-                });
+            const result = resultByKey.get(key);
+            if (result?.error) {
+                const old = this.state.containers?.[key] || null;
+                snapshot.push(containerFromInventory(inventory, con.uid, key, old));
                 errors[key] = errorText(result.error);
-            } else {
+            } else if (result?.detail) {
                 const detail = { ...result.detail, uid: con.uid, key };
+                detail.healthDetailsLoaded = true;
                 snapshot.push(detail);
+            } else {
+                const old = this.state.containers?.[key] || null;
+                snapshot.push(containerFromInventory(inventory, con.uid, key, old));
             }
         }
 
@@ -707,8 +792,8 @@ class Application extends React.Component {
     }
 
     initContainers(con) {
-        // Initial inventory/inspect/scheduler work uses the same global owner
-        // gate as periodic refreshes.  This prevents startup from launching an
+        // Initial inventory and deferred health work use the same global owner
+        // gate as periodic refreshes. This prevents startup from launching an
         // unbounded burst across every discovered Podman context.
         this.healthRefreshGate.invalidate(con.uid);
         const entry = this.healthRefreshGate.start(con.uid, refreshRequest =>
@@ -723,6 +808,16 @@ class Application extends React.Component {
                 !this.healthRefreshGate.isCurrent(con.uid, entry.request) &&
                 !this.state.users.find(user => user.uid === con.uid)?.containersLoaded)
                 return this.initContainers(con);
+
+            // Inventory rows are committed before the expensive detail pass.
+            // Start that pass only after the initial gate has settled so the
+            // first render is not held behind one inspect per container.
+            if (this.isCurrentConnection(con)) {
+                setTimeout(() => {
+                    if (this.isCurrentConnection(con))
+                        this.refreshOwnerHealth(con);
+                }, 0);
+            }
         }).catch(error => {
             console.warn("initContainers uid", con.uid, "failed:", error?.toString?.() || error);
             this.markOwnerHealthUnavailable(con, entry.request, error);
@@ -756,35 +851,9 @@ class Application extends React.Component {
                 throw new Error("container inventory is not an array");
             const validInventory = containerList.filter(isContainerInventoryRow);
             const invalidInventoryRow = validInventory.length !== containerList.length;
-            let schedulerPromise = null;
-            if (!invalidInventoryRow) {
-                // Start the bounded collector from the inventory snapshot;
-                // waiting for all inspect workers first used the whole refresh
-                // budget before scheduler metadata could run.
-                schedulerPromise = this.updateSchedulerCoverage(con, validInventory, request, refreshRequest,
-                                                                 HEALTH_SCHEDULER_TIMEOUT_MS);
-            }
-            const results = await mapWithConcurrency(containerList, async container => {
-                if (!isContainerInventoryRow(container))
-                    return { container, error: new Error("Container inventory row is invalid") };
-                const remaining = Math.min(HEALTH_INSPECT_TIMEOUT_MS, deadline - Date.now());
-                if (remaining <= 0)
-                    return { container, error: new Error("Initial container inspect timed out") };
-                try {
-                    const inspectRequest = this.inspectContainer(con, container.Id);
-                    const detail = await this.withContainerRequestTimeout(inspectRequest, remaining,
-                                                                          "Initial container inspect timed out");
-                    return { container, detail };
-                } catch (error) {
-                    return { container, error };
-                }
-            }, HEALTH_INSPECT_CONCURRENCY);
             if (!this.isCurrentConnection(con))
                 return;
 
-            const validResults = results.filter(result => isContainerInventoryRow(result.container));
-            const schedulerContainers = validResults.map(result =>
-                isContainerInventoryRow(result.detail) ? result.detail : result.container);
             this.setState(prevState => {
                 const stillLoading = !prevState.users.find(user => user.uid === con.uid)?.containersLoaded;
                 if (!this.isCurrentConnection(con) ||
@@ -800,7 +869,7 @@ class Application extends React.Component {
                             copyContainerErrors[id] = prevState.containerErrors[id];
                     }
                 });
-                const listedKeys = new Set(validResults.map(result => makeKey(con.uid, result.container.Id)));
+                const listedKeys = new Set(validInventory.map(container => makeKey(con.uid, container.Id)));
                 Object.entries(prevState.containers || {}).forEach(([key, container]) => {
                     if (container.uid !== con.uid || listedKeys.has(key))
                         return;
@@ -815,8 +884,8 @@ class Application extends React.Component {
                     if (prevState.containerErrors?.[key])
                         copyContainerErrors[key] = prevState.containerErrors[key];
                 });
-                for (const result of validResults) {
-                    const id = result.container.Id;
+                for (const inventory of validInventory) {
+                    const id = inventory.Id;
                     const key = makeKey(con.uid, id);
                     const snapshotGeneration = initialEventGenerations.get(key) || 0;
                     const currentGeneration = this.containerEventGenerations.get(key) || 0;
@@ -834,31 +903,13 @@ class Application extends React.Component {
                             continue;
                         }
                     }
-                    const invalidDetail = !result.error && !isContainerInventoryRow(result.detail);
-                    if (result.error || invalidDetail) {
-                        // Keep a row when possible so the owner and full ID
-                        // remain visible while inspect is down or malformed.
-                        const old = prevState.containers?.[key];
-                        const detail = old || {
-                            ...result.container,
-                            Id: id,
-                            Name: result.container.Names?.[0]?.replace(/^\//, "") || id,
-                            ImageName: result.container.ImageName || result.container.Image,
-                            Config: result.container.Config || {},
-                            State: { Status: String(result.container.State || "").toLowerCase() },
-                            uid: con.uid,
-                            key,
-                        };
-                        copyContainers[key] = detail;
-                        copyContainerErrors[key] = errorText(result.error ||
-                                                             new Error("Container inspect returned an invalid object"));
-                        continue;
-                    }
-
-                    const detail = result.detail;
-                    detail.uid = con.uid;
-                    detail.key = key;
-                    copyContainers[key] = detail;
+                    // The inventory call is deliberately the first render
+                    // source. It supplies lifecycle and identity while the
+                    // owner health refresh obtains the optional detail.
+                    const current = prevState.containers?.[key] || null;
+                    copyContainers[key] = containerFromInventory(inventory, con.uid, key, current);
+                    if (current && prevState.containerErrors?.[key])
+                        copyContainerErrors[key] = prevState.containerErrors[key];
                 }
 
                 const users = prevState.users.map(u => u.uid === con.uid ? { ...u, containersLoaded: true } : u);
@@ -872,11 +923,12 @@ class Application extends React.Component {
             this.updateContainerStats(con);
             if (invalidInventoryRow) {
                 const schedulerRequest = this.schedulerRequests.begin(con.uid);
-                this.applySchedulerCoverage(con, this.schedulerUid(con), schedulerContainers, null,
+                this.applySchedulerCoverage(con, this.schedulerUid(con), validInventory, null,
                                             SCHEDULER_FAILURE, schedulerRequest);
                 return;
             }
-            await schedulerPromise;
+            // The deferred owner health pass starts scheduler collection from
+            // the same inventory snapshot as its bounded detail requests.
         } catch (error) {
             if (!this.isCurrentConnection(con))
                 return;
@@ -983,6 +1035,7 @@ class Application extends React.Component {
                         return;
                     details.uid = con.uid;
                     details.key = key;
+                    details.healthDetailsLoaded = true;
                     // HACK: during restart State never changes from "running"
                     //       override it to reconnect console after restart
                     if (event?.Action === "restart")

@@ -336,6 +336,10 @@ const localize_health_assessment = (assessment) => {
 
 const health_reason = (assessment) => {
     switch (assessment.status) {
+    case healthStates.starting:
+        return assessment.reason === "details-pending"
+            ? _("Health details are still loading")
+            : null;
     case healthStates.missing:
         return _("No health check configured");
     case healthStates.stale:

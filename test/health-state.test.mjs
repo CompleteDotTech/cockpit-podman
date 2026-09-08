@@ -5,11 +5,41 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { healthAssessment, healthStates } from "../src/health.js";
+import { healthAssessment, healthStates, shouldInspectHealth } from "../src/health.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixtures = JSON.parse(await readFile(resolve(here, "browser-health-fixtures.json"), "utf8"));
 const now = Date.parse(fixtures.now);
+
+assert.equal(shouldInspectHealth({ Id: "running-missing", State: "running" }, {
+    State: { Status: "running" },
+    healthDetailsLoaded: true,
+    Config: { Healthcheck: { Test: ["NONE"] } },
+}), false);
+assert.equal(shouldInspectHealth({ Id: "running-configured", State: "running" }, {
+    State: { Status: "running" },
+    healthDetailsLoaded: true,
+    Config: { Healthcheck: { Test: ["CMD-SHELL", "true"] } },
+}), true);
+assert.equal(shouldInspectHealth({ Id: "stopped-configured", State: "exited" }, {
+    State: { Status: "exited" },
+    healthDetailsLoaded: true,
+    Config: { Healthcheck: { Test: ["CMD-SHELL", "true"] } },
+}), false);
+assert.equal(shouldInspectHealth({ Id: "running-pending", State: "running" }, {
+    State: { Status: "running" },
+    healthDetailsLoaded: false,
+}), true);
+assert.equal(healthAssessment({
+    Id: "inventory-only",
+    State: { Status: "running" },
+    healthDetailsLoaded: false,
+}, now).status, healthStates.starting);
+assert.equal(healthAssessment({
+    Id: "inventory-only",
+    State: { Status: "running" },
+    healthDetailsLoaded: false,
+}, now).reason, "details-pending");
 
 assert.equal(healthAssessment({
     Id: "partial-health-config",
