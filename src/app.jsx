@@ -615,6 +615,8 @@ class Application extends React.Component {
     }
 
     queueContainerStats(con, stats) {
+        if (!this.isCurrentConnection(con))
+            return;
         if (!Array.isArray(stats) || stats.length === 0)
             return;
 

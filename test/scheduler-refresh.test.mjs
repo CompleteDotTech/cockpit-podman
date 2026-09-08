@@ -9,6 +9,16 @@ import { KeyedRequestGate, mapWithConcurrency, OwnerRefreshGate, RequestConcurre
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = JSON.parse(await readFile(resolve(here, "scheduler-refresh-fixture.json"), "utf8"));
+
+// A closed connection can still deliver one final stats frame after a
+// same-UID reconnect. The production guard must run before that stale frame
+// can replace the new connection's pending batch or cancel its timer.
+const applicationSource = await readFile(resolve(here, "../src/app.jsx"), "utf8");
+const statsQueueStart = applicationSource.indexOf("    queueContainerStats(con, stats) {");
+const statsQueueEnd = applicationSource.indexOf("\n    clearContainerStats", statsQueueStart);
+assert.ok(statsQueueStart >= 0 && statsQueueEnd > statsQueueStart);
+const statsQueueBody = applicationSource.slice(statsQueueStart, statsQueueEnd);
+assert.ok(statsQueueBody.startsWith("    queueContainerStats(con, stats) {\n        if (!this.isCurrentConnection(con))\n            return;"));
 const gate = new SchedulerRequestGate();
 const applied = [];
 
