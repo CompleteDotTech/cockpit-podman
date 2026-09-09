@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { healthAssessment, healthStates, isValidHealthDetails, shouldInspectHealth } from "../src/health.js";
+import { healthAssessment, healthStates, isValidHealthDetails, lifecycleDisposition, shouldInspectHealth } from "../src/health.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixtures = JSON.parse(await readFile(resolve(here, "browser-health-fixtures.json"), "utf8"));
@@ -209,6 +209,106 @@ assert.equal(healthAssessment(explicitStateOneShot, now, null, fixtures.stopped.
 const restartPolicyOnly = structuredClone(exitedSuccessfully);
 restartPolicyOnly.Config.Labels = { "io.kubernetes.container.restartPolicy": "Never" };
 assert.equal(healthAssessment(restartPolicyOnly, now, null, fixtures.stopped.scheduler).status, healthStates.stopped);
+
+// A disposition supplied by the owner is accepted only when it is bound to
+// the current full container identity. It is lifecycle metadata, not a health
+// result, and it never overrides a running container.
+const dispositionIdentity = {
+    id: "stopped-id",
+    uid: 0,
+    host: "train.home.complete.tech",
+    context: "rootful",
+};
+const completedFromMetadata = structuredClone(exitedSuccessfully);
+completedFromMetadata.uid = 0;
+completedFromMetadata.host = "train.home.complete.tech";
+completedFromMetadata.context = "rootful";
+completedFromMetadata.LifecycleDisposition = {
+    ...dispositionIdentity,
+    class: "completed_one_shot",
+    reason: "bootstrap job completed and is not a live workload",
+    evidence: "recovery-ledger",
+};
+assert.equal(lifecycleDisposition(completedFromMetadata)?.class, "completed_one_shot");
+assert.equal(healthAssessment(completedFromMetadata, now, null, fixtures.stopped.scheduler).status, healthStates.completed);
+assert.equal(healthAssessment(completedFromMetadata, now, null, fixtures.stopped.scheduler).disposition.reason,
+             "bootstrap job completed and is not a live workload");
+
+for (const [label, mismatch] of [
+    ["full ID", { ...dispositionIdentity, id: "different-id" }],
+    ["owner UID", { ...dispositionIdentity, uid: 1000 }],
+    ["host", { ...dispositionIdentity, host: "other-host" }],
+    ["context", { ...dispositionIdentity, context: "rootless" }],
+]) {
+    const mismatched = structuredClone(completedFromMetadata);
+    mismatched.LifecycleDisposition = { ...mismatch, class: "completed_one_shot" };
+    assert.equal(lifecycleDisposition(mismatched), null, label);
+    assert.equal(healthAssessment(mismatched, now, null, fixtures.stopped.scheduler).status,
+                 healthStates.stopped, label);
+}
+
+const retiredFromMetadata = structuredClone(completedFromMetadata);
+retiredFromMetadata.State.ExitCode = 143;
+retiredFromMetadata.LifecycleDisposition = {
+    ...dispositionIdentity,
+    class: "retired",
+    reason: "replaced by an active rootless service",
+};
+assert.equal(healthAssessment(retiredFromMetadata, now, "inventory refresh timed out", fixtures.stopped.scheduler).status,
+             healthStates.retired);
+assert.equal(healthAssessment(retiredFromMetadata, now, null, fixtures.stopped.scheduler).disposition.reason,
+             "replaced by an active rootless service");
+
+const staleRetirement = structuredClone(retiredFromMetadata);
+staleRetirement.State.Status = "running";
+staleRetirement.State.ExitCode = undefined;
+staleRetirement.Config.Healthcheck = {
+    Test: ["CMD-SHELL", "true"],
+    Interval: 30000000000,
+    Timeout: 5000000000,
+};
+staleRetirement.State.Health = {
+    Status: "healthy",
+    Log: [{ Start: "2026-09-08T12:00:30Z", End: "2026-09-08T12:00:31Z", ExitCode: 0 }],
+};
+assert.equal(healthAssessment(staleRetirement, now, null, fixtures.healthy.scheduler).status, healthStates.healthy);
+
+const infrastructure = structuredClone(staleRetirement);
+infrastructure.LifecycleDisposition = {
+    ...dispositionIdentity,
+    class: "infrastructure_only",
+    reason: "Podman infrastructure container",
+};
+assert.equal(healthAssessment(infrastructure, now, null, fixtures.healthy.scheduler).status,
+             healthStates.infrastructure);
+const runtimeInfrastructure = structuredClone(staleRetirement);
+runtimeInfrastructure.IsInfra = true;
+delete runtimeInfrastructure.LifecycleDisposition;
+assert.equal(healthAssessment(runtimeInfrastructure, now, null, fixtures.healthy.scheduler).status,
+             healthStates.infrastructure);
+
+const labelCompleted = structuredClone(exitedSuccessfully);
+labelCompleted.Config.Labels = {
+    "com.complete.tech.lifecycle.disposition": "completed_one_shot",
+    "com.complete.tech.lifecycle.reason": "owner-declared one-shot",
+};
+assert.equal(healthAssessment(labelCompleted, now, null, fixtures.stopped.scheduler).status, healthStates.completed);
+
+const labelShortName = structuredClone(exitedSuccessfully);
+labelShortName.Config.Labels = { "com.complete.tech.lifecycle.disposition": "completed" };
+assert.equal(healthAssessment(labelShortName, now, null, fixtures.stopped.scheduler).status, healthStates.stopped);
+
+const retainedFixture = structuredClone(exitedSuccessfully);
+retainedFixture.Config.Labels = {
+    "com.complete.tech.lifecycle.disposition": "retained_test_fixture",
+    "com.complete.tech.lifecycle.reason": "retained fixture; no live service",
+};
+assert.equal(healthAssessment(retainedFixture, now, null, fixtures.stopped.scheduler).status, healthStates.retired);
+
+const unsafeReason = structuredClone(completedFromMetadata);
+unsafeReason.LifecycleDisposition.reason = "see https://example.invalid/secret";
+assert.equal(healthAssessment(unsafeReason, now, null, fixtures.stopped.scheduler).status, healthStates.completed);
+assert.equal(healthAssessment(unsafeReason, now, null, fixtures.stopped.scheduler).disposition.reason, null);
 
 const slowSchedule = { ...fixtures.stale.scheduler, effective_interval_seconds: 180, jitter_seconds: 10, accuracy_seconds: 1 };
 assert.equal(healthAssessment(fixtures.stale.container, now, null, slowSchedule).status, healthStates.healthy);

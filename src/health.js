@@ -16,7 +16,162 @@ export const healthStates = Object.freeze({
     error: "error",
     stopped: "stopped",
     completed: "completed",
+    retired: "retired",
+    infrastructure: "infrastructure",
 });
+
+// A lifecycle disposition is optional metadata supplied by the container
+// owner.  Podman does not infer that an exited container was a one-shot job,
+// and the display must not turn names, exit codes, or Compose service names
+// into that claim.  Owners may provide the structured object through the
+// inventory/inspect response or persist the same contract as labels on the
+// container.  The identity fields are required for structured metadata so a
+// record from an older container cannot survive a replacement.
+export const lifecycleDispositionClasses = Object.freeze({
+    completed: "completed_one_shot",
+    retired: "retired",
+    infrastructure: "infrastructure_only",
+});
+
+const LIFECYCLE_DISPOSITION_LABEL = "com.complete.tech.lifecycle.disposition";
+const LIFECYCLE_REASON_LABEL = "com.complete.tech.lifecycle.reason";
+const LIFECYCLE_EVIDENCE_LABEL = "com.complete.tech.lifecycle.evidence";
+export const lifecycleDispositionLabels = Object.freeze({
+    disposition: LIFECYCLE_DISPOSITION_LABEL,
+    reason: LIFECYCLE_REASON_LABEL,
+    evidence: LIFECYCLE_EVIDENCE_LABEL,
+});
+const LIFECYCLE_CLASSES = new Set(Object.values(lifecycleDispositionClasses));
+const RETIRED_CLASSES = new Set([
+    "retired",
+    "retired_model",
+    "retired_service",
+    "retained",
+    "retained_build_helper",
+    "retained_created_fixture",
+    "retained_replaced_service",
+    "retained_stopped_object",
+    "retained_test_fixture",
+    "retained_unknown_exited",
+    "retained_validation_fixture",
+]);
+const INFRASTRUCTURE_CLASSES = new Set(["infrastructure", "infrastructure_only", "infra", "infra_only", "not_applicable"]);
+const LIFECYCLE_TEXT_MAX_LENGTH = 240;
+
+const lifecycleText = value => {
+    if (typeof value !== "string" || value.length === 0 || value.length > LIFECYCLE_TEXT_MAX_LENGTH ||
+        /[\u0000-\u001f\u007f]/.test(value) || /https?:\/\//i.test(value))
+        return null;
+    return value.trim() || null;
+};
+
+const lifecycleClass = (value, source) => {
+    if (typeof value !== "string")
+        return null;
+    const normalized = value.trim().toLowerCase().replace(/-/g, "_");
+    if (LIFECYCLE_CLASSES.has(normalized))
+        return normalized;
+    // Aliases are accepted only in explicit owner metadata or Podman's direct
+    // infra marker. The display never derives them from names, commands,
+    // images, or exit codes.
+    if ((source === "metadata" || source === "label" || source === "runtime") && RETIRED_CLASSES.has(normalized))
+        return lifecycleDispositionClasses.retired;
+    if ((source === "metadata" || source === "label" || source === "runtime") && INFRASTRUCTURE_CLASSES.has(normalized))
+        return lifecycleDispositionClasses.infrastructure;
+    if (source === "metadata" && normalized === "completed")
+        return lifecycleDispositionClasses.completed;
+    return null;
+};
+
+const lifecycleMetadataObject = container => {
+    const candidates = [
+        [container?.LifecycleDisposition, "metadata"],
+        [container?.Lifecycle?.Disposition, "metadata"],
+        [container?.Lifecycle?.disposition, "metadata"],
+        [container?.lifecycle?.disposition, "metadata"],
+        [container?.lifecycle?.Disposition, "metadata"],
+        [container?.lifecycleDisposition, "metadata"],
+        [container?.Disposition, "metadata"],
+        [container?.State?.LifecycleDisposition, "metadata"],
+        [container?.State?.lifecycle?.disposition, "metadata"],
+        [container?.Config?.LifecycleDisposition, "metadata"],
+    ];
+    for (const [value, source] of candidates) {
+        if (value && typeof value === "object" && !Array.isArray(value))
+            return { value, source };
+    }
+
+    const labels = container?.Config?.Labels || container?.Labels || {};
+    const labelClass = labels[LIFECYCLE_DISPOSITION_LABEL];
+    if (typeof labelClass === "string" && labelClass.length > 0)
+        return {
+            value: {
+                class: labelClass,
+                reason: labels[LIFECYCLE_REASON_LABEL],
+                evidence: labels[LIFECYCLE_EVIDENCE_LABEL],
+            },
+            source: "label",
+        };
+    // Podman marks pod infra containers explicitly. This is a role
+    // classification from the runtime, not an inference from a name or
+    // image, and therefore needs no external owner record.
+    if (container?.IsInfra === true)
+        return {
+            value: { class: lifecycleDispositionClasses.infrastructure, reason: "Podman infrastructure container" },
+            source: "runtime",
+        };
+    return null;
+};
+
+const lifecycleIdentityMatches = (container, metadata, source) => {
+    if (source === "label" || source === "runtime")
+        return true;
+
+    // Structured metadata is an external assertion. It must bind to the full
+    // current container ID, and binds to owner/host/context whenever those
+    // values are available on both sides of the response.
+    const metadataId = metadata.id ?? metadata.container_id ?? metadata.containerId;
+    if (metadataId !== container?.Id || typeof metadataId !== "string" || metadataId.length === 0)
+        return false;
+    if (metadata.uid !== undefined && metadata.uid !== container?.uid)
+        return false;
+    for (const [metadataKey, containerKeys] of [
+        ["host", ["host", "Host"]],
+        ["context", ["context", "Context"]],
+    ]) {
+        if (metadata[metadataKey] === undefined)
+            continue;
+        const containerValue = containerKeys.map(key => container?.[key]).find(value => value !== undefined);
+        if (containerValue !== undefined && metadata[metadataKey] !== containerValue)
+            return false;
+    }
+    return true;
+};
+
+// Return only owner-authored lifecycle metadata.  A null result is deliberate
+// and keeps an ambiguous row on the ordinary stopped/no-health path.
+export const lifecycleDisposition = container => {
+    const candidate = lifecycleMetadataObject(container);
+    if (!candidate || !lifecycleIdentityMatches(container, candidate.value, candidate.source))
+        return null;
+
+    const dispositionClass = lifecycleClass(candidate.value.class, candidate.source);
+    if (!dispositionClass)
+        return null;
+    const metadataId = candidate.value.id ?? candidate.value.container_id ?? candidate.value.containerId;
+    const reason = lifecycleText(candidate.value.reason);
+    const evidence = lifecycleText(candidate.value.evidence);
+    return {
+        class: dispositionClass,
+        reason,
+        evidence,
+        source: candidate.source,
+        id: metadataId ?? null,
+        uid: candidate.value.uid ?? null,
+        host: candidate.value.host ?? null,
+        context: candidate.value.context ?? null,
+    };
+};
 
 // Error details from Podman, systemd, and Cockpit can contain command lines,
 // URLs, or health output.  The display only needs an allowlisted reason; the
@@ -153,7 +308,9 @@ export const isCompletedContainer = container => {
     const state = container?.State;
     const config = container?.Config;
     const labels = config?.Labels || container?.Labels || {};
-    return isTrueMarker(container?.Completed) ||
+    const disposition = lifecycleDisposition(container);
+    return disposition?.class === lifecycleDispositionClasses.completed ||
+        isTrueMarker(container?.Completed) ||
         isTrueMarker(container?.OneShot) ||
         isTrueMarker(state?.Completed) ||
         isTrueMarker(state?.OneShot) ||
@@ -286,6 +443,7 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
     const staleAfterMs = freshness.staleAfterMs;
     const freshWindowMs = null;
     const nativeStatus = state?.Status || null;
+    const disposition = lifecycleDisposition(container);
 
     const base = extra => ({
         rawStatus: nativeStatus,
@@ -297,17 +455,25 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
         freshWindowMs,
         cadenceSource: freshness.cadenceSource,
         schedule: effectiveScheduler || null,
+        disposition,
         ...extra,
     });
 
     const lifecycle = String(container?.State?.Status || "").toLowerCase();
+    if (disposition?.class === lifecycleDispositionClasses.infrastructure) {
+        return base({
+            status: healthStates.infrastructure,
+            reason: "infrastructure",
+        });
+    }
     if (lifecycle && lifecycle !== "running") {
         const exitCode = container?.State?.ExitCode;
         const completed = lifecycle === "exited" && (exitCode === 0 || exitCode === "0") &&
             isCompletedContainer(container);
+        const retired = disposition?.class === lifecycleDispositionClasses.retired;
         return base({
-            status: completed ? healthStates.completed : healthStates.stopped,
-            reason: completed ? "completed" : "stopped",
+            status: completed ? healthStates.completed : retired ? healthStates.retired : healthStates.stopped,
+            reason: completed ? "completed" : retired ? "retired" : "stopped",
         });
     }
 

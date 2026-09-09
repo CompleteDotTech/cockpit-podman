@@ -77,7 +77,8 @@
 }
 
 .ct-badge-container-health-missing, .ct-badge-container-health-unknown,
-.ct-badge-container-health-stopped, .ct-badge-container-health-completed {
+.ct-badge-container-health-stopped, .ct-badge-container-health-completed,
+.ct-badge-container-health-retired, .ct-badge-container-health-infrastructure {
     background-color: var(--pf-t--global--border--color--default);
     color: var(--pf-t--global--text--color--regular);
 }

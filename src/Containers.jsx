@@ -329,6 +329,10 @@ const localize_health_assessment = (assessment) => {
         return _("Stopped");
     case healthStates.completed:
         return _("Completed");
+    case healthStates.retired:
+        return _("Retired");
+    case healthStates.infrastructure:
+        return _("Infrastructure");
     default:
         return _("Health unknown");
     }
@@ -363,7 +367,11 @@ const health_reason = (assessment) => {
     case healthStates.stopped:
         return _("Container is stopped; health result is not live");
     case healthStates.completed:
-        return _("Container completed; health result is not live");
+        return assessment.disposition?.reason || _("Container completed; health result is not live");
+    case healthStates.retired:
+        return assessment.disposition?.reason || _("Container is retired; health result is not live");
+    case healthStates.infrastructure:
+        return assessment.disposition?.reason || _("Infrastructure container; application health is not applicable");
     default:
         return null;
     }
@@ -804,7 +812,9 @@ class Containers extends React.Component {
                     [healthStates.missing]: 5,
                     [healthStates.healthy]: 6,
                     [healthStates.completed]: 7,
-                    [healthStates.stopped]: 8,
+                    [healthStates.retired]: 8,
+                    [healthStates.infrastructure]: 9,
+                    [healthStates.stopped]: 10,
                 };
                 return (order[a_health] ?? 7) - (order[b_health] ?? 7);
             }

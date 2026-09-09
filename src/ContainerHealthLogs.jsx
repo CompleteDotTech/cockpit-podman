@@ -68,7 +68,11 @@ const ContainerHealthLogs = ({ con, container, onAddNotification, state, assessm
         case "stopped":
             return _("Container is stopped; health result is not live");
         case "completed":
-            return _("Container completed; health result is not live");
+            return assessment.disposition?.reason || _("Container completed; health result is not live");
+        case "retired":
+            return assessment.disposition?.reason || _("Container is retired; health result is not live");
+        case "infrastructure":
+            return assessment.disposition?.reason || _("Infrastructure container; application health is not applicable");
         default:
             return null;
         }
