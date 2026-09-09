@@ -122,6 +122,7 @@ export class RequestConcurrencyGate {
         let resolveEntry;
         let rejectEntry;
         let resolveStarted;
+        let resolveFinished;
         const promise = new Promise((resolve, reject) => {
             resolveEntry = resolve;
             rejectEntry = reject;
@@ -130,6 +131,12 @@ export class RequestConcurrencyGate {
             resolveStarted = resolve;
         });
         promise.started = started;
+        // Cancellation settles the caller immediately; transport completion
+        // remains separate so keyed callers retain serialization while the
+        // canceled physical request is still draining.
+        promise.finished = new Promise(resolve => {
+            resolveFinished = resolve;
+        });
         const entry = {
             operation,
             promise,
@@ -139,6 +146,7 @@ export class RequestConcurrencyGate {
             started: false,
             settled: false,
             resolveStarted,
+            resolveFinished,
         };
         promise.close = (problem = "cancelled") => {
             if (entry.settled)
@@ -149,11 +157,16 @@ export class RequestConcurrencyGate {
                     this.pending.splice(index, 1);
                 entry.settled = true;
                 entry.resolveStarted?.(false);
+                entry.resolveFinished();
                 entry.reject?.(new Error(problem));
                 return;
             }
             entry.settled = true;
-            entry.request?.close?.(problem);
+            try {
+                entry.request?.close?.(problem);
+            } catch {
+                // Cleanup failures must not leave the caller promise pending.
+            }
             entry.reject?.(new Error(problem));
         };
         this.pending.push(entry);
@@ -204,6 +217,7 @@ export class RequestConcurrencyGate {
             return;
         entry.started = false;
         this.active--;
+        entry.resolveFinished();
         this.drain();
     }
 }
@@ -211,11 +225,13 @@ export class RequestConcurrencyGate {
 // Serialize requests for one container identity while allowing different
 // containers to use the global request budget.  A newer generation replaces
 // only an older queued request; an already running request is allowed to
-// settle before the latest request starts.
+// settle before the latest request starts. Callers share the transport, but
+// each owns its cancellation handle and deadline.
 export class KeyedRequestGate {
-    constructor(run) {
+    constructor(run, timeoutMs = null) {
         this.runRequest = run;
         this.states = new Map();
+        this.timeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : null;
     }
 
     request(key, metadata, operation, canReuse) {
@@ -224,10 +240,10 @@ export class KeyedRequestGate {
             state = { active: null, queued: null };
             this.states.set(key, state);
         }
-        if (state.active && canReuse(state.active.metadata))
-            return state.active.promise;
-        if (state.queued && canReuse(state.queued.metadata))
-            return state.queued.promise;
+        if (state.active && !state.active.settled && canReuse(state.active.metadata))
+            return this.observe(state.active);
+        if (state.queued && !state.queued.settled && canReuse(state.queued.metadata))
+            return this.observe(state.queued);
 
         if (state.queued)
             state.queued.promise.close("superseded");
@@ -248,6 +264,8 @@ export class KeyedRequestGate {
             request: null,
             started: false,
             settled: false,
+            observers: new Set(),
+            timer: null,
         };
         const started = new Promise(resolve => {
             entry.resolveStarted = resolve;
@@ -256,6 +274,7 @@ export class KeyedRequestGate {
         promise.close = (problem = "cancelled") => {
             if (entry.settled)
                 return;
+            clearTimeout(entry.timer);
             if (!entry.started) {
                 if (state.queued === entry)
                     state.queued = null;
@@ -266,7 +285,12 @@ export class KeyedRequestGate {
                 return;
             }
             entry.settled = true;
-            entry.request?.close?.(problem);
+            try {
+                entry.request?.close?.(problem);
+            } catch {
+                // A disconnected bridge can throw during cleanup. Its
+                // observers must still receive the cancellation result.
+            }
             entry.reject?.(new Error(problem));
         };
 
@@ -274,6 +298,37 @@ export class KeyedRequestGate {
             state.queued = entry;
         else
             this.start(key, state, entry);
+        return this.observe(entry);
+    }
+
+    observe(entry) {
+        let rejectObserver;
+        let resolveStarted;
+        const observer = { settled: false };
+        entry.observers.add(observer);
+        const finish = (callback, value) => {
+            if (observer.settled)
+                return;
+            observer.settled = true;
+            entry.observers.delete(observer);
+            callback(value);
+        };
+        const promise = new Promise((resolve, reject) => {
+            rejectObserver = reject;
+            entry.promise.then(value => finish(resolve, value), error => finish(reject, error));
+        });
+        promise.started = new Promise(resolve => {
+            resolveStarted = resolve;
+        });
+        entry.promise.started.then(resolveStarted);
+        promise.close = (problem = "cancelled") => {
+            if (observer.settled)
+                return;
+            resolveStarted(false);
+            finish(rejectObserver, new Error(problem));
+            if (entry.observers.size === 0)
+                entry.promise.close(problem);
+        };
         return promise;
     }
 
@@ -284,10 +339,18 @@ export class KeyedRequestGate {
         try {
             request = this.runRequest(entry.operation);
             entry.request = request;
+            const started = didStart => {
+                entry.resolveStarted(didStart);
+                // A new observer must not extend an in-flight transport's
+                // deadline. Keep the transport bounded even when callers
+                // join with different amounts of time left in their refresh.
+                if (didStart && !entry.settled && this.timeoutMs !== null)
+                    entry.timer = setTimeout(() => entry.promise.close("timeout"), this.timeoutMs);
+            };
             if (request?.started)
-                request.started.then(entry.resolveStarted);
+                request.started.then(started);
             else
-                entry.resolveStarted(true);
+                started(true);
         } catch (error) {
             entry.settled = true;
             entry.resolveStarted(false);
@@ -313,12 +376,16 @@ export class KeyedRequestGate {
                         entry.reject(error);
                     }
                 })
-                .finally(() => this.finish(key, state, entry));
+                .finally(async () => {
+                    await request?.finished;
+                    this.finish(key, state, entry);
+                });
     }
 
     finish(key, state, entry) {
         if (state.active !== entry)
             return;
+        clearTimeout(entry.timer);
         state.active = null;
         const next = state.queued;
         state.queued = null;

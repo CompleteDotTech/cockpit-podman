@@ -436,6 +436,208 @@ assert.notEqual(reconnectRefresh, eventRefresh);
 assert.equal(await reconnectRefresh, "reconnect");
 assert.deepEqual(keyedRuns, ["pre-event", "event", "reconnect"]);
 
+// The periodic refresh can reach an inspect near its overall deadline while
+// an event still has time to consume the same in-flight result. Expiring one
+// caller must not cancel another caller's request or manufacture a row error.
+const sharedRequests = new KeyedRequestGate(operation => operation());
+let finishShared;
+let sharedTransportCloses = 0;
+let sharedTransportStarts = 0;
+const sharedOperation = () => {
+    sharedTransportStarts++;
+    const request = new Promise(resolveResponse => { finishShared = resolveResponse; });
+    request.close = () => { sharedTransportCloses++; };
+    return request;
+};
+const periodicInspect = sharedRequests.request("shared-container", {}, sharedOperation, () => true);
+const eventInspect = sharedRequests.request("shared-container", {}, sharedOperation, () => true);
+const periodicOutcome = assert.rejects(periodicInspect, /timeout/);
+const eventOutcome = assert.doesNotReject(eventInspect);
+periodicInspect.close("timeout");
+await periodicOutcome;
+assert.equal(sharedTransportCloses, 0);
+finishShared("fresh-health");
+await eventOutcome;
+assert.equal(await eventInspect, "fresh-health");
+assert.equal(sharedTransportStarts, 1);
+
+// A last caller timeout still cancels the underlying transport. A shared
+// queued request survives an unrelated caller's timeout, but cancellation of
+// its final caller prevents that queued operation from starting later.
+const sharedPool = new RequestConcurrencyGate(1);
+const queuedSharedRequests = new KeyedRequestGate(operation => sharedPool.run(operation));
+let finishHeld;
+const heldSlot = sharedPool.run(() => new Promise(resolveResponse => { finishHeld = resolveResponse; }));
+let queuedStarts = 0;
+const queuedOperation = () => { queuedStarts++; return Promise.resolve("queued-health"); };
+const shortQueued = queuedSharedRequests.request("queued-container", {}, queuedOperation, () => true);
+const longQueued = queuedSharedRequests.request("queued-container", {}, queuedOperation, () => true);
+const shortOutcome = assert.rejects(shortQueued, /timeout/);
+shortQueued.close("timeout");
+await shortOutcome;
+assert.equal(await shortQueued.started, false);
+assert.equal(sharedPool.pending.length, 1);
+const longOutcome = assert.rejects(longQueued, /timeout/);
+longQueued.close("timeout");
+await longOutcome;
+assert.equal(await longQueued.started, false);
+assert.equal(sharedPool.pending.length, 0);
+finishHeld();
+await heldSlot;
+assert.equal(queuedStarts, 0);
+
+// A close callback can throw while its physical request is still draining.
+// Both cancellation and later completion must settle cleanly, and another
+// generation of the same container cannot consume a second free pool slot.
+const drainingPool = new RequestConcurrencyGate(2);
+const drainingKeys = new KeyedRequestGate(operation => drainingPool.run(operation));
+let finishDraining;
+let drainingStarts = 0;
+let drainingActive = 0;
+let maximumDrainingActive = 0;
+const draining = drainingKeys.request("draining-container", { generation: 0 }, () => {
+    drainingStarts++;
+    drainingActive++;
+    maximumDrainingActive = Math.max(maximumDrainingActive, drainingActive);
+    const promise = new Promise(resolveResponse => {
+        finishDraining = () => { drainingActive--; resolveResponse("obsolete"); };
+    });
+    promise.close = () => { throw new Error("bridge already closed"); };
+    return promise;
+}, metadata => metadata.generation === 0);
+const drainingOutcome = assert.rejects(draining, /timeout/);
+draining.close("timeout");
+await drainingOutcome;
+const afterDrain = drainingKeys.request("draining-container", { generation: 1 }, () => {
+    drainingStarts++;
+    drainingActive++;
+    maximumDrainingActive = Math.max(maximumDrainingActive, drainingActive);
+    drainingActive--;
+    return Promise.resolve("current-health");
+}, metadata => metadata.generation === 1);
+await new Promise(resolveResponse => setImmediate(resolveResponse));
+assert.equal(drainingPool.active, 1);
+assert.equal(drainingStarts, 1);
+finishDraining();
+assert.equal(await withTimeout(afterDrain, 250, "replacement-blocked"), "current-health");
+assert.equal(drainingStarts, 2);
+assert.equal(maximumDrainingActive, 1);
+
+// Joining an existing inspect must not renew its transport deadline. Use a
+// virtual clock so the boundary is deterministic and independent of host load.
+const originalSetTimeout = globalThis.setTimeout;
+const originalClearTimeout = globalThis.clearTimeout;
+const transportTimers = new Map();
+let clockMs = 0;
+let timerId = 0;
+globalThis.setTimeout = (callback, delay) => {
+    const id = ++timerId;
+    transportTimers.set(id, { callback, due: clockMs + delay });
+    return id;
+};
+globalThis.clearTimeout = id => transportTimers.delete(id);
+try {
+    let finishTransport;
+    let transportCloses = 0;
+    const deadlineGate = new KeyedRequestGate(operation => operation(), 5000);
+    const operation = () => {
+        const promise = new Promise(resolveResponse => { finishTransport = resolveResponse; });
+        promise.close = () => { transportCloses++; };
+        return promise;
+    };
+    const first = deadlineGate.request("deadline-container", {}, operation, () => true);
+    clockMs = 4000;
+    const late = deadlineGate.request("deadline-container", {}, operation, () => true);
+    const outcomes = [assert.rejects(first, /timeout/), assert.rejects(late, /timeout/)];
+    assert.equal(transportTimers.size, 1);
+    const timer = [...transportTimers.values()][0];
+    assert.equal(timer.due, 5000);
+    clockMs = 5000;
+    timer.callback();
+    await Promise.all(outcomes);
+    assert.equal(transportCloses, 1);
+    assert.equal(transportTimers.size, 0);
+    // A canceled entry cannot be reused while its physical transport drains.
+    const replacement = deadlineGate.request("deadline-container", {}, () => Promise.resolve("replacement"), () => true);
+    finishTransport("late-obsolete-health");
+    assert.equal(await replacement, "replacement");
+
+    // A synchronous last-observer cancellation can precede the pool's start
+    // notification. It must not install a timer or release capacity early.
+    const pool = new RequestConcurrencyGate(1);
+    const keyedPool = new KeyedRequestGate(operation => pool.run(operation), 5000);
+    let finishCanceled;
+    let canceledCloses = 0;
+    const canceled = keyedPool.request("canceled-container", {}, () => {
+        const promise = new Promise(resolveResponse => { finishCanceled = resolveResponse; });
+        promise.close = () => { canceledCloses++; };
+        return promise;
+    }, () => true);
+    const canceledOutcome = assert.rejects(canceled, /timeout/);
+    canceled.close("timeout");
+    await canceledOutcome;
+    assert.equal(canceledCloses, 1);
+    assert.equal(pool.active, 1);
+    assert.equal(transportTimers.size, 0);
+    let recoveredStarts = 0;
+    const recovered = keyedPool.request("next-container", {}, () => {
+        recoveredStarts++;
+        return Promise.resolve("next-health");
+    }, () => true);
+    assert.equal(recoveredStarts, 0);
+    finishCanceled();
+    assert.equal(await recovered, "next-health");
+    assert.equal(recoveredStarts, 1);
+} finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+}
+
+// Disconnecting an owner terminates all shared and queued observers, including
+// a newer event generation; none may leak a result into a replacement context.
+const disconnectGate = new KeyedRequestGate(operation => operation());
+const oldOwner = {};
+let disconnectedCloses = 0;
+let obsoleteQueuedStarts = 0;
+const disconnectOperation = () => {
+    let rejectTransport;
+    const promise = new Promise((resolveResponse, rejectResponse) => { rejectTransport = rejectResponse; });
+    promise.close = problem => { disconnectedCloses++; rejectTransport(new Error(problem)); };
+    return promise;
+};
+const disconnected = [0, 0, 1, 1].map(generation => disconnectGate.request(
+    "owner-container", { con: oldOwner, generation },
+    generation === 0 ? disconnectOperation : () => { obsoleteQueuedStarts++; return Promise.resolve("obsolete"); },
+    metadata => metadata.con === oldOwner && metadata.generation === generation,
+));
+const disconnectedOutcomes = disconnected.map(request => assert.rejects(request, /owner-disconnected/));
+disconnectGate.closeWhere(metadata => metadata.con === oldOwner, "owner-disconnected");
+await Promise.all(disconnectedOutcomes);
+assert.equal(disconnectedCloses, 1);
+assert.equal(obsoleteQueuedStarts, 0);
+assert.equal(await disconnectGate.request("owner-container", { con: {} }, () => Promise.resolve("new-owner"), () => false), "new-owner");
+
+const supersedingGate = new KeyedRequestGate(operation => operation());
+let finishEarlierGeneration;
+const earlierGeneration = supersedingGate.request("event-container", { generation: 0 },
+    () => new Promise(resolveResponse => { finishEarlierGeneration = resolveResponse; }), () => false);
+let supersededStarts = 0;
+const supersededObservers = [1, 1].map(generation => supersedingGate.request("event-container", { generation },
+    () => { supersededStarts++; return Promise.resolve("obsolete"); }, metadata => metadata.generation === generation));
+const supersededOutcomes = supersededObservers.map(request => assert.rejects(request, /superseded/));
+const newestGeneration = supersedingGate.request("event-container", { generation: 2 },
+    () => Promise.resolve("newest-health"), metadata => metadata.generation === 2);
+await Promise.all(supersededOutcomes);
+assert.deepEqual(await Promise.all(supersededObservers.map(request => request.started)), [false, false]);
+finishEarlierGeneration("old-health");
+await earlierGeneration;
+assert.equal(await newestGeneration, "newest-health");
+assert.equal(supersededStarts, 0);
+await new Promise(resolveResponse => setImmediate(resolveResponse));
+assert.equal(supersedingGate.states.size, 0);
+assert.equal(drainingKeys.states.size, 0);
+assert.equal(drainingPool.active, 0);
+
 const capacityGate = new RequestConcurrencyGate(8);
 let activeRequests = 0;
 let maxActiveRequests = 0;
