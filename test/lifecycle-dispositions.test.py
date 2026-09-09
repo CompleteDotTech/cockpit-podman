@@ -14,6 +14,11 @@ SPEC = importlib.util.spec_from_file_location("lifecycle_dispositions", ROOT / "
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
+BUILD_SPEC = importlib.util.spec_from_file_location(
+    "lifecycle_bootstrap_build", ROOT / "packaging" / "lifecycle-bootstrap" / "build.py")
+BUILD = importlib.util.module_from_spec(BUILD_SPEC)
+assert BUILD_SPEC.loader is not None
+BUILD_SPEC.loader.exec_module(BUILD)
 
 
 HOST = "train.home.complete.tech"
@@ -25,8 +30,12 @@ assert {record["id"] for record in packet["records"]} == {
     record["id"] for record in json.loads(PACKET_PATH.read_text())["records"]
 }
 assert {record["disposition"] for record in packet["records"]} == {"completed_one_shot", "retired", "stopped"}
+assert {record["provenance"]["kind"] for record in packet["records"]} == {"operator-policy"}
 assert {record["provenance"]["source"] for record in packet["records"]} == {"source-decisions.json"}
-assert all(record["provenance"]["owner_verified"] is True for record in packet["records"])
+assert {record["provenance"]["source_ref"] for record in packet["records"]} == {BUILD.SUPPORTED_EVIDENCE_REF}
+assert {record["provenance"]["policy_sha256"] for record in packet["records"]} == {MODULE.SOURCE_LEDGER_SHA256}
+assert sum(record["provenance"]["owner_verified"] is True for record in packet["records"]) == 21
+assert sum(record["provenance"]["owner_verified"] is False for record in packet["records"]) == 3
 
 rootful = MODULE.project(packet, 0, authoritative=HOST, runtime_uid=0, manifest_digest=manifest_digest)
 rootless = MODULE.project(packet, 1000, authoritative=HOST, runtime_uid=1000, manifest_digest=manifest_digest)
@@ -62,6 +71,33 @@ try:
         raise AssertionError("generic identity metadata must fail closed")
 finally:
     MODULE.sys.stdin = original_stdin
+
+
+def assert_owner_rejected(row):
+    try:
+        BUILD.owner_from_capture(row)
+    except ValueError:
+        return
+    raise AssertionError("unsupported owner evidence must fail closed")
+
+
+assert_owner_rejected({"source_owner": {"kind": "fabricated-owner", "labels": {}}})
+assert_owner_rejected({"source_owner": {
+    "kind": "compose",
+    "compose_project": "project",
+    "compose_service": "service",
+    "labels": {"com.docker.compose.project": "other", "com.docker.compose.service": "service"},
+}})
+unknown_owner = BUILD.owner_from_capture({"source_owner": {"kind": "unknown", "labels": {}}})
+assert unknown_owner["kind"] == "unknown"
+assert unknown_owner["verified"] is False
+compose_owner = BUILD.owner_from_capture({"source_owner": {
+    "kind": "compose",
+    "compose_project": "project",
+    "compose_service": "service",
+    "labels": {"com.docker.compose.project": "project", "com.docker.compose.service": "service"},
+}})
+assert compose_owner["verified"] is True
 
 with tempfile.TemporaryDirectory() as temporary:
     copy = Path(temporary) / "packet"

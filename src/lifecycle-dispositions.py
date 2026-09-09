@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Read and project the protected lifecycle bootstrap packet.
+"""Read and project the protected lifecycle operator-policy packet.
 
-The packet is generated from a private Podman capture, a Cockpit display
-snapshot, and the ownership evidence for the same full IDs.  This process is
-read-only: it never invokes Podman, starts a container, or changes a host.
-Every file in the packet is hash-checked before any record is emitted.
+The packet records explicit maintainer decisions against a private Podman
+capture, a Cockpit display snapshot, and ownership evidence for the same full
+IDs.  This process is read-only: it never invokes Podman, starts a container,
+or changes a host.  Every file in the packet is hash-checked before any
+record is emitted.
 """
 
 from __future__ import annotations
@@ -28,6 +29,9 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 TEXT_MAX = 240
 CONTEXTS = {"rootful", "rootless"}
 DISPOSITIONS = {"completed_one_shot", "retired", "infrastructure_only", "stopped"}
+POLICY_PROVENANCE_KIND = "operator-policy"
+POLICY_SOURCE = "source-decisions.json"
+POLICY_EVIDENCE_REF = "worktrees/misc-source/train.home.complete.tech/ops/fleet-recovery-20260907.md"
 EXPECTED_RECORD_COUNT = 24
 EXPECTED_COUNTS = {
     "completed_one_shot": 3,
@@ -37,7 +41,7 @@ EXPECTED_COUNTS = {
 }
 # This is deliberately pinned in code.  A caller cannot replace both the
 # packet and its manifest without also changing the reviewed collector.
-BOOTSTRAP_MANIFEST_SHA256 = "4d2aced182edd5d7ae320a8c4686839d1b90810bdbad5e3e0459f71226cf4e47"
+BOOTSTRAP_MANIFEST_SHA256 = "fb4d8feaa66ef30fa723badbe5ddb66607976658bffb75056360c7c36b31a81a"
 SOURCE_LEDGER_SHA256 = "b58d2c2b95f46efc3cbd4fdf3b2c62a0024190c091d668e0a6f754d553ee4f81"
 DEFAULT_PACKET = "/etc/cockpit-podman/lifecycle-bootstrap/lifecycle-bootstrap.json"
 
@@ -221,11 +225,14 @@ def verify_bootstrap(packet_path: Path, expected_manifest: str = BOOTSTRAP_MANIF
         actual_counts[disposition] += 1
         reason = safe_text(record.get("reason"), "lifecycle reason")
         provenance = record.get("provenance")
-        if not isinstance(provenance, dict) or provenance.get("kind") != "source" or provenance.get("source") != "source-decisions.json":
-            raise RecordError("lifecycle record provenance is not source-bound")
-        safe_text(provenance.get("source_ref"), "source reference")
-        if provenance.get("owner_verified") is not True:
-            raise RecordError("lifecycle record lacks verified source ownership")
+        if not isinstance(provenance, dict) or provenance.get("kind") != POLICY_PROVENANCE_KIND or \
+                provenance.get("source") != POLICY_SOURCE:
+            raise RecordError("lifecycle record provenance is not operator-policy-bound")
+        if provenance.get("source_ref") != POLICY_EVIDENCE_REF:
+            raise RecordError("lifecycle record evidence is not the reviewed policy source")
+        if provenance.get("policy_sha256") != SOURCE_LEDGER_SHA256 or \
+                not isinstance(provenance.get("owner_verified"), bool):
+            raise RecordError("lifecycle record policy evidence is invalid")
 
         inventory = sources["source-inventory.json"][key]
         display = sources["source-display.json"][key]
@@ -240,12 +247,15 @@ def verify_bootstrap(packet_path: Path, expected_manifest: str = BOOTSTRAP_MANIF
                 decision.get("ownership_row_sha256") != digest(ownership):
             raise RecordError("source row digest binding mismatch")
         if decision.get("disposition") != disposition or decision.get("reason") != reason or \
-                decision.get("owner_verified") is not True or ownership.get("owner_verified") is not True:
+                decision.get("owner_verified") is not ownership.get("owner_verified") or \
+                provenance.get("owner_verified") is not ownership.get("owner_verified"):
             raise RecordError("source decision does not agree with packet")
         if display.get("running") is not False or inventory.get("running") is not False:
             raise RecordError("source evidence is running")
         safe_text(decision.get("source_class"), "source class", 96)
-        safe_text(decision.get("source_ref"), "source reference")
+        if decision.get("source_ref") != provenance.get("source_ref") or \
+                decision.get("source_ref") != POLICY_EVIDENCE_REF:
+            raise RecordError("source decision evidence does not agree with policy")
 
     if actual_counts != EXPECTED_COUNTS or len(seen) != EXPECTED_RECORD_COUNT:
         raise RecordError("source packet counts do not match protected contract")

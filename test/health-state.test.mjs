@@ -198,13 +198,13 @@ assert.equal(healthAssessment(exitedSuccessfully, now, null, fixtures.stopped.sc
 
 const completedOneShot = structuredClone(exitedSuccessfully);
 completedOneShot.OneShot = true;
-assert.equal(healthAssessment(completedOneShot, now, null, fixtures.stopped.scheduler).status, healthStates.completed);
+assert.equal(healthAssessment(completedOneShot, now, null, fixtures.stopped.scheduler).status, healthStates.stopped);
 assert.equal(healthAssessment(completedOneShot, now, "inventory refresh timed out", fixtures.stopped.scheduler).status,
-             healthStates.completed);
+             healthStates.stopped);
 
 const explicitStateOneShot = structuredClone(exitedSuccessfully);
 explicitStateOneShot.State.OneShot = true;
-assert.equal(healthAssessment(explicitStateOneShot, now, null, fixtures.stopped.scheduler).status, healthStates.completed);
+assert.equal(healthAssessment(explicitStateOneShot, now, null, fixtures.stopped.scheduler).status, healthStates.stopped);
 
 const restartPolicyOnly = structuredClone(exitedSuccessfully);
 restartPolicyOnly.Config.Labels = { "io.kubernetes.container.restartPolicy": "Never" };
@@ -220,9 +220,10 @@ const dispositionIdentity = {
     context: "rootful",
 };
 const sourceProvenance = {
-    kind: "source",
+    kind: "operator-policy",
     source: "source-decisions.json",
-    source_ref: "source-ledger-row",
+    source_ref: "worktrees/misc-source/train.home.complete.tech/ops/fleet-recovery-20260907.md",
+    policy_sha256: "b58d2c2b95f46efc3cbd4fdf3b2c62a0024190c091d668e0a6f754d553ee4f81",
     owner_verified: true,
     manifest_sha256: "c".repeat(64),
     decision_sha256: "d".repeat(64),

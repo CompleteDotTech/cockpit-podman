@@ -15,11 +15,11 @@ const fixture = JSON.parse(await readFile(resolve(here, "scheduler-refresh-fixtu
 // same-UID reconnect. The production guard must run before that stale frame
 // can replace the new connection's pending batch or cancel its timer.
 const applicationSource = await readFile(resolve(here, "../src/app.jsx"), "utf8");
-// Exercise the production inventory mapping with a real list-shaped one-shot.
+// Inventory markers cannot promote an exited row to a completed one-shot.
 const inventoryMapperStart = applicationSource.indexOf("const containerFromInventory =");
 const inventoryMapperEnd = applicationSource.indexOf("\n// sort order", inventoryMapperStart);
 const mapInventory = new Function(applicationSource.slice(inventoryMapperStart, inventoryMapperEnd) + "\nreturn containerFromInventory;")();
-for (const [exitCode, expected] of [[0, "completed"], ["0", "completed"], [1, "stopped"], [null, "stopped"], [undefined, "stopped"]]) {
+for (const [exitCode, expected] of [[0, "stopped"], ["0", "stopped"], [1, "stopped"], [null, "stopped"], [undefined, "stopped"]]) {
     const row = mapInventory({ Id: "one-shot", Names: ["one-shot"], State: "exited", ExitCode: exitCode,
         Labels: { "com.docker.compose.oneoff": "True" } }, 0, "0-one-shot");
     assert.equal(healthAssessment(row).status, expected);

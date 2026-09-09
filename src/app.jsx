@@ -48,6 +48,8 @@ const HEALTH_INSPECT_CONCURRENCY = 8;
 const HEALTH_SCHEDULER_TIMEOUT_MS = 8000;
 const CONTAINER_INSPECT_INVALID = "Container inspect response is invalid";
 const LIFECYCLE_SCHEMA = "cockpit-podman-lifecycle/v1";
+const LIFECYCLE_POLICY_SHA256 = "b58d2c2b95f46efc3cbd4fdf3b2c62a0024190c091d668e0a6f754d553ee4f81";
+const LIFECYCLE_POLICY_EVIDENCE_REF = "worktrees/misc-source/train.home.complete.tech/ops/fleet-recovery-20260907.md";
 const LIFECYCLE_COLLECTOR_FAILURE = "lifecycle-disposition-unavailable";
 const LIFECYCLE_COLLECTOR_TIMEOUT_MS = 5000;
 const LIFECYCLE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
@@ -123,9 +125,11 @@ const lifecycleRecordsFromOutput = (output, containers, contextUid) => {
             return null;
         const provenance = record.provenance;
         if (!provenance || typeof provenance !== "object" || Array.isArray(provenance) ||
-            provenance.kind !== "source" || provenance.source !== "source-decisions.json" ||
-            !lifecycleRecordText(provenance.source_ref) ||
-            provenance.owner_verified !== true || provenance.manifest_sha256 !== output.manifest_sha256 ||
+            provenance.kind !== "operator-policy" || provenance.source !== "source-decisions.json" ||
+            provenance.source_ref !== LIFECYCLE_POLICY_EVIDENCE_REF ||
+            provenance.policy_sha256 !== LIFECYCLE_POLICY_SHA256 ||
+            typeof provenance.owner_verified !== "boolean" ||
+            provenance.manifest_sha256 !== output.manifest_sha256 ||
             !FULL_SHA256.test(provenance.decision_sha256))
             return null;
         if (records.has(record.id))

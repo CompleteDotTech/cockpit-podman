@@ -30,6 +30,10 @@ EXPECTED_COUNTS = {
     "infrastructure_only": 0,
     "stopped": 1,
 }
+SUPPORTED_OWNER_KINDS = {"compose", "unknown"}
+POLICY_PROVENANCE_KIND = "operator-policy"
+POLICY_SOURCE = "source-decisions.json"
+SUPPORTED_EVIDENCE_REF = "worktrees/misc-source/train.home.complete.tech/ops/fleet-recovery-20260907.md"
 SOURCE_CLASSES = {
     "completed_one_shot": "completed_one_shot",
     "retained_build_helper": "retired",
@@ -81,17 +85,30 @@ def owner_from_capture(row: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(source, dict):
         raise ValueError(f"missing source owner for {row.get('id')}")
     kind = text(source.get("kind"), "owner kind", 64)
+    if kind not in SUPPORTED_OWNER_KINDS:
+        raise ValueError(f"unsupported owner kind: {kind}")
     project = source.get("compose_project")
     service = source.get("compose_service")
     unit = source.get("unit")
     for value, field in ((project, "owner project"), (service, "owner service"), (unit, "owner unit")):
         if value is not None:
             text(value, field, 240)
-    # ``verified`` means that this identity was present in the captured
-    # source row and was bound to the full ID.  ``kind_known`` stays separate:
-    # an unknown owner is valid evidence for the stopped disposition, while
-    # the packet still records that the source ownership field was checked.
-    verified = True
+    labels = source.get("labels")
+    if not isinstance(labels, dict):
+        raise ValueError("owner labels are not an object")
+    if kind == "compose":
+        if not isinstance(project, str) or not project or not isinstance(service, str) or not service:
+            raise ValueError("compose owner lacks project or service")
+        if labels.get("com.docker.compose.project") != project or \
+                labels.get("com.docker.compose.service") != service:
+            raise ValueError("compose owner labels do not verify project and service")
+        verified = True
+    else:
+        if project is not None or service is not None or unit is not None or labels:
+            raise ValueError("unknown owner carries unsupported ownership claims")
+        # The capture verifies that ownership is unknown.  It does not verify
+        # a concrete owner, so lifecycle decisions remain explicit policy.
+        verified = False
     return {
         "kind": kind,
         "project": project,
@@ -180,10 +197,9 @@ def build(args: argparse.Namespace) -> None:
             raise ValueError(f"unsupported source class: {source_class}")
         reason = text(disposition.get("reason"), "source reason")
         evidence = text(disposition.get("evidence"), "source evidence")
+        if evidence != SUPPORTED_EVIDENCE_REF:
+            raise ValueError(f"unsupported source evidence for {identifier}")
         owner = owner_from_capture(capture_row)
-        if canonical_disposition != "stopped" and not owner["verified"]:
-            raise ValueError(f"owner evidence is not verified for {identifier}")
-
         inventory_record = {
             "host": host,
             "context": context,
@@ -246,9 +262,10 @@ def build(args: argparse.Namespace) -> None:
             "reason": reason,
             "decision_sha256": digest(decision),
             "provenance": {
-                "kind": "source",
-                "source": "source-decisions.json",
+                "kind": POLICY_PROVENANCE_KIND,
+                "source": POLICY_SOURCE,
                 "source_ref": evidence,
+                "policy_sha256": file_digest(args.ledger),
                 "owner_verified": owner["verified"],
             },
         })

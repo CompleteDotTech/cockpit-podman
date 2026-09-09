@@ -35,6 +35,8 @@ const LIFECYCLE_CLASSES = new Set(Object.values(lifecycleDispositionClasses));
 const LIFECYCLE_TEXT_MAX_LENGTH = 240;
 const FULL_LIFECYCLE_ID = /^[0-9a-f]{64}$/;
 const FULL_SHA256 = /^[0-9a-f]{64}$/;
+const LIFECYCLE_POLICY_SHA256 = "b58d2c2b95f46efc3cbd4fdf3b2c62a0024190c091d668e0a6f754d553ee4f81";
+const LIFECYCLE_POLICY_EVIDENCE_REF = "worktrees/misc-source/train.home.complete.tech/ops/fleet-recovery-20260907.md";
 
 const lifecycleText = value => {
     if (typeof value !== "string" || value.length === 0 || value.length > LIFECYCLE_TEXT_MAX_LENGTH ||
@@ -70,9 +72,10 @@ const lifecycleIdentityMatches = (container, metadata) => {
     if (typeof state !== "string" || state.length === 0)
         return false;
     return container?.uid === metadata.uid && container?.host === metadata.host &&
-        container?.context === metadata.context && provenance.kind === "source" &&
-        provenance.source === "source-decisions.json" && lifecycleText(provenance.source_ref) &&
-        provenance.owner_verified === true &&
+        container?.context === metadata.context && provenance.kind === "operator-policy" &&
+        provenance.source === "source-decisions.json" && provenance.source_ref === LIFECYCLE_POLICY_EVIDENCE_REF &&
+        provenance.policy_sha256 === LIFECYCLE_POLICY_SHA256 &&
+        typeof provenance.owner_verified === "boolean" &&
         FULL_SHA256.test(provenance.manifest_sha256) && FULL_SHA256.test(provenance.decision_sha256) &&
         state.toLowerCase() !== "running" && !/^up\b/i.test(state);
 };
@@ -224,31 +227,14 @@ const healthExitCode = value => {
     return Number.isSafeInteger(parsed) ? parsed : null;
 };
 
-const isTrueMarker = value => value === true ||
-    (typeof value === "string" && ["1", "true", "yes"].includes(value.toLowerCase()));
-
 // Podman exposes the exit code for every exited container, but an exit code of
 // zero does not say that a workload was a one-shot job.  Only classify an
-// exited container as completed when the inspect payload carries explicit
-// one-shot metadata. The direct fields support normalized API fixtures; only
-// Podman's standardized Compose one-shot marker is accepted as a built-in
-// runtime fact. Custom lifecycle labels and arbitrary inspect annotations stay
-// outside this contract.
+// exited container as completed when the protected lifecycle policy collector
+// supplies a verified disposition; labels and arbitrary inspect annotations
+// stay outside this contract.
 export const isCompletedContainer = container => {
-    const state = container?.State;
-    const config = container?.Config;
-    const labels = config?.Labels || container?.Labels || {};
     const disposition = lifecycleDisposition(container);
-    return disposition?.class === lifecycleDispositionClasses.completed ||
-        isTrueMarker(container?.Completed) ||
-        isTrueMarker(container?.OneShot) ||
-        isTrueMarker(state?.Completed) ||
-        isTrueMarker(state?.OneShot) ||
-        isTrueMarker(config?.Completed) ||
-        isTrueMarker(config?.OneShot) ||
-        // This is Podman's standardized Compose one-shot marker, separate
-        // from the protected lifecycle-disposition metadata contract.
-        isTrueMarker(labels["com.docker.compose.oneoff"]);
+    return disposition?.class === lifecycleDispositionClasses.completed;
 };
 
 export const observedHealthInterval = state => {
