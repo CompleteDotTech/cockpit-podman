@@ -290,10 +290,11 @@ class Application extends React.Component {
         // polling interval indefinitely.
         this.healthRefreshFollowups = new Map();
         // Keep all owner refreshes and event-driven inspects within one
-        // bounded Podman HTTP request pool. Per-request deadlines start when
-        // a queued request actually reaches the transport.
+        // bounded Podman HTTP request pool. Each caller's deadline includes
+        // queue time; the shared transport also has a fixed execution limit.
         this.containerRequestGate = new RequestConcurrencyGate(HEALTH_INSPECT_CONCURRENCY);
-        this.containerInspectRequests = new KeyedRequestGate(operation => this.containerRequestGate.run(operation));
+        this.containerInspectRequests = new KeyedRequestGate(operation => this.containerRequestGate.run(operation),
+                                                             HEALTH_INSPECT_TIMEOUT_MS);
         this.pendingContainerStats = new Map();
         this.containerStatsTimers = new Map();
         this.ownerConnections = new Map();
