@@ -20,13 +20,10 @@ export const healthStates = Object.freeze({
     infrastructure: "infrastructure",
 });
 
-// A lifecycle disposition is optional metadata supplied by the container
-// owner.  Podman does not infer that an exited container was a one-shot job,
-// and the display must not turn names, exit codes, or Compose service names
-// into that claim.  Owners may provide the structured object through the
-// inventory/inspect response or persist the same contract as labels on the
-// container.  The identity fields are required for structured metadata so a
-// record from an older container cannot survive a replacement.
+// A lifecycle disposition is optional source metadata from the protected
+// bootstrap collector. Podman does not infer that an exited container was a
+// one-shot job, and the display must not turn names, exit codes, service names,
+// labels, or arbitrary inspect fields into that claim.
 export const lifecycleDispositionClasses = Object.freeze({
     completed: "completed_one_shot",
     retired: "retired",
@@ -34,17 +31,10 @@ export const lifecycleDispositionClasses = Object.freeze({
     stopped: "stopped",
 });
 
-const LIFECYCLE_DISPOSITION_LABEL = "com.complete.tech.lifecycle.disposition";
-const LIFECYCLE_REASON_LABEL = "com.complete.tech.lifecycle.reason";
-const LIFECYCLE_EVIDENCE_LABEL = "com.complete.tech.lifecycle.evidence";
-export const lifecycleDispositionLabels = Object.freeze({
-    disposition: LIFECYCLE_DISPOSITION_LABEL,
-    reason: LIFECYCLE_REASON_LABEL,
-    evidence: LIFECYCLE_EVIDENCE_LABEL,
-});
 const LIFECYCLE_CLASSES = new Set(Object.values(lifecycleDispositionClasses));
 const LIFECYCLE_TEXT_MAX_LENGTH = 240;
 const FULL_LIFECYCLE_ID = /^[0-9a-f]{64}$/;
+const FULL_SHA256 = /^[0-9a-f]{64}$/;
 
 const lifecycleText = value => {
     if (typeof value !== "string" || value.length === 0 || value.length > LIFECYCLE_TEXT_MAX_LENGTH ||
@@ -54,111 +44,61 @@ const lifecycleText = value => {
 };
 
 const lifecycleClass = value => {
-    if (typeof value !== "string")
-        return null;
-    const normalized = value.trim().toLowerCase().replace(/-/g, "_");
-    if (LIFECYCLE_CLASSES.has(normalized))
-        return normalized;
-    return null;
+    return typeof value === "string" && LIFECYCLE_CLASSES.has(value) ? value : null;
 };
 
 const lifecycleMetadataObject = container => {
-    const candidates = [
-        [container?.LifecycleDisposition, container?.LifecycleDisposition?.provenance ? "record" : "metadata"],
-        [container?.Lifecycle?.Disposition, "metadata"],
-        [container?.Lifecycle?.disposition, "metadata"],
-        [container?.lifecycle?.disposition, "metadata"],
-        [container?.lifecycle?.Disposition, "metadata"],
-        [container?.lifecycleDisposition, "metadata"],
-        [container?.Disposition, "metadata"],
-        [container?.State?.LifecycleDisposition, "metadata"],
-        [container?.State?.lifecycle?.disposition, "metadata"],
-        [container?.Config?.LifecycleDisposition, "metadata"],
-    ];
-    for (const [value, source] of candidates) {
-        if (value && typeof value === "object" && !Array.isArray(value))
-            return { value, source };
-    }
-
-    const labels = container?.Config?.Labels || container?.Labels || {};
-    const labelClass = labels[LIFECYCLE_DISPOSITION_LABEL];
-    if (typeof labelClass === "string" && labelClass.length > 0)
-        return {
-            value: {
-                class: labelClass,
-                reason: labels[LIFECYCLE_REASON_LABEL],
-                evidence: labels[LIFECYCLE_EVIDENCE_LABEL],
-            },
-            source: "label",
-        };
-    // Podman marks pod infra containers explicitly. This is a role
-    // classification from the runtime, not an inference from a name or
-    // image, and therefore needs no external owner record.
-    if (container?.IsInfra === true)
-        return {
-            value: { class: lifecycleDispositionClasses.infrastructure, reason: "Podman infrastructure container" },
-            source: "runtime",
-        };
-    return null;
+    const value = container?.LifecycleDisposition;
+    return value && typeof value === "object" && !Array.isArray(value) &&
+        value.provenance && typeof value.provenance === "object" && !Array.isArray(value.provenance)
+        ? { value, source: "record" }
+        : null;
 };
 
-const lifecycleIdentityMatches = (container, metadata, source) => {
-    if (source === "label" || source === "runtime")
-        return true;
-
-    // Structured metadata is an external assertion. It must bind to the full
-    // current container ID, and binds to owner/host/context whenever those
-    // values are available on both sides of the response.
-    const metadataId = metadata.id ?? metadata.container_id ?? metadata.containerId;
-    if (metadataId !== container?.Id || typeof metadataId !== "string" || metadataId.length === 0)
+const lifecycleIdentityMatches = (container, metadata) => {
+    const metadataId = metadata.id;
+    if (metadataId !== container?.Id || !FULL_LIFECYCLE_ID.test(metadataId))
         return false;
-    if (source === "record") {
-        if (!FULL_LIFECYCLE_ID.test(metadataId) ||
-            typeof metadata.uid !== "number" || !Number.isInteger(metadata.uid) ||
-            typeof metadata.host !== "string" || metadata.host.length === 0 ||
-            typeof metadata.context !== "string" || metadata.context.length === 0)
-            return false;
-        if (container?.uid !== metadata.uid || container?.host !== metadata.host ||
-            container?.context !== metadata.context)
-            return false;
-    }
-    if (metadata.uid !== undefined && metadata.uid !== container?.uid)
+    if (typeof metadata.uid !== "number" || !Number.isInteger(metadata.uid) || metadata.uid < 0 ||
+        typeof metadata.host !== "string" || metadata.host.length === 0 ||
+        typeof metadata.context !== "string" || !["rootful", "rootless"].includes(metadata.context))
         return false;
-    for (const [metadataKey, containerKeys] of [
-        ["host", ["host", "Host"]],
-        ["context", ["context", "Context"]],
-    ]) {
-        if (metadata[metadataKey] === undefined)
-            continue;
-        const containerValue = containerKeys.map(key => container?.[key]).find(value => value !== undefined);
-        if (containerValue !== undefined && metadata[metadataKey] !== containerValue)
-            return false;
-    }
-    return true;
+    const provenance = metadata.provenance;
+    const state = typeof container?.State === "string"
+        ? container.State
+        : container?.State?.Status || container?.Status || "";
+    if (typeof state !== "string" || state.length === 0)
+        return false;
+    return container?.uid === metadata.uid && container?.host === metadata.host &&
+        container?.context === metadata.context && provenance.kind === "source" &&
+        provenance.source === "source-decisions.json" && lifecycleText(provenance.source_ref) &&
+        provenance.owner_verified === true &&
+        FULL_SHA256.test(provenance.manifest_sha256) && FULL_SHA256.test(provenance.decision_sha256) &&
+        state.toLowerCase() !== "running" && !/^up\b/i.test(state);
 };
 
 // Return only owner-authored lifecycle metadata.  A null result is deliberate
 // and keeps an ambiguous row on the ordinary stopped/no-health path.
 export const lifecycleDisposition = container => {
     const candidate = lifecycleMetadataObject(container);
-    if (!candidate || !lifecycleIdentityMatches(container, candidate.value, candidate.source))
+    if (!candidate || !lifecycleIdentityMatches(container, candidate.value))
         return null;
 
     const dispositionClass = lifecycleClass(candidate.value.class);
     if (!dispositionClass)
         return null;
-    const metadataId = candidate.value.id ?? candidate.value.container_id ?? candidate.value.containerId;
     const reason = lifecycleText(candidate.value.reason);
-    const evidence = lifecycleText(candidate.value.evidence ?? candidate.value.provenance?.source);
+    const evidence = lifecycleText(candidate.value.provenance.source);
     return {
         class: dispositionClass,
         reason,
         evidence,
         source: candidate.source,
-        id: metadataId ?? null,
-        uid: candidate.value.uid ?? null,
-        host: candidate.value.host ?? null,
-        context: candidate.value.context ?? null,
+        id: candidate.value.id,
+        uid: candidate.value.uid,
+        host: candidate.value.host,
+        context: candidate.value.context,
+        provenance: candidate.value.provenance,
     };
 };
 
@@ -290,9 +230,10 @@ const isTrueMarker = value => value === true ||
 // Podman exposes the exit code for every exited container, but an exit code of
 // zero does not say that a workload was a one-shot job.  Only classify an
 // exited container as completed when the inspect payload carries explicit
-// one-shot metadata.  The direct fields also support normalized API fixtures;
-// the labels cover the common Compose and Kubernetes sources that persist this
-// distinction in Podman inspect output.
+// one-shot metadata. The direct fields support normalized API fixtures; only
+// Podman's standardized Compose one-shot marker is accepted as a built-in
+// runtime fact. Custom lifecycle labels and arbitrary inspect annotations stay
+// outside this contract.
 export const isCompletedContainer = container => {
     const state = container?.State;
     const config = container?.Config;
@@ -305,6 +246,8 @@ export const isCompletedContainer = container => {
         isTrueMarker(state?.OneShot) ||
         isTrueMarker(config?.Completed) ||
         isTrueMarker(config?.OneShot) ||
+        // This is Podman's standardized Compose one-shot marker, separate
+        // from the protected lifecycle-disposition metadata contract.
         isTrueMarker(labels["com.docker.compose.oneoff"]);
 };
 
@@ -449,12 +392,9 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
     });
 
     const lifecycle = String(container?.State?.Status || "").toLowerCase();
-    if (disposition?.class === lifecycleDispositionClasses.infrastructure) {
-        return base({
-            status: healthStates.infrastructure,
-            reason: "infrastructure",
-        });
-    }
+    const role = container?.IsInfra === true || disposition?.class === lifecycleDispositionClasses.infrastructure
+        ? "infrastructure"
+        : null;
     if (lifecycle && lifecycle !== "running") {
         const exitCode = container?.State?.ExitCode;
         const completed = lifecycle === "exited" && (exitCode === 0 || exitCode === "0") &&
@@ -463,6 +403,7 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
         return base({
             status: completed ? healthStates.completed : retired ? healthStates.retired : healthStates.stopped,
             reason: completed ? "completed" : retired ? "retired" : "stopped",
+            role,
         });
     }
 
@@ -472,6 +413,7 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
         return base({
             status: healthStates.error,
             reason: collectionReason(collectionError),
+            role,
             error: collectionReason(collectionError) === "collection-timeout"
                 ? HEALTH_COLLECTION_TIMEOUT
                 : HEALTH_COLLECTION_ERROR,
@@ -485,6 +427,7 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
         return base({
             status: healthStates.starting,
             reason: "details-pending",
+            role,
         });
     }
 
@@ -493,6 +436,7 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
             status: healthStates.missing,
             configured: false,
             reason: "missing",
+            role,
         });
     }
 
@@ -500,6 +444,7 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
         return base({
             status: healthStates.unhealthy,
             reason: "unhealthy",
+            role,
         });
     }
 
@@ -507,6 +452,7 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
         return base({
             status: healthStates.starting,
             reason: "starting",
+            role,
         });
     }
 
@@ -518,6 +464,7 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
         return base({
             status: healthStates.unhealthy,
             reason: "latest-check-failed",
+            role,
         });
     }
 
@@ -525,6 +472,7 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
         return base({
             status: healthStates.unknown,
             reason: "latest-check-unknown",
+            role,
         });
     }
 
@@ -533,6 +481,7 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
             status: healthStates.error,
             reason: "scheduler-error",
             error: SCHEDULER_ERROR,
+            role,
         });
     }
 
@@ -540,6 +489,7 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
         return base({
             status: healthStates.stale,
             reason: "stale",
+            role,
         });
     }
 
@@ -547,11 +497,13 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
         return base({
             status: healthStates.healthy,
             reason: "healthy",
+            role,
         });
     }
 
     return base({
         status: healthStates.unknown,
         reason: nativeStatus === "healthy" ? freshness.reason : "no-result",
+        role,
     });
 };

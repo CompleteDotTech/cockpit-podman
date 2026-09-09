@@ -72,6 +72,8 @@ appstream-util validate-relax --nonet %{buildroot}/%{_datadir}/metainfo/*
 %doc README.md
 %license LICENSE dist/index.js.LEGAL.txt dist/index.css.LEGAL.txt
 %{_datadir}/cockpit/*
+%dir %{_sysconfdir}/cockpit-podman
+%config(noreplace) %{_sysconfdir}/cockpit-podman/lifecycle-bootstrap/*
 %{_datadir}/metainfo/*
 
 %changelog

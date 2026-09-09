@@ -131,6 +131,14 @@ clean:
 install: $(DIST_TEST) po/LINGUAS
 	mkdir -p $(DESTDIR)$(PREFIX)/share/cockpit/$(PACKAGE_NAME)
 	cp -r dist/* $(DESTDIR)$(PREFIX)/share/cockpit/$(PACKAGE_NAME)
+	mkdir -p $(DESTDIR)/etc/cockpit-podman/lifecycle-bootstrap
+	install -m 0644 packaging/lifecycle-bootstrap/manifest.json \
+		packaging/lifecycle-bootstrap/lifecycle-bootstrap.json \
+		packaging/lifecycle-bootstrap/source-inventory.json \
+		packaging/lifecycle-bootstrap/source-display.json \
+		packaging/lifecycle-bootstrap/source-ownership.json \
+		packaging/lifecycle-bootstrap/source-decisions.json \
+		$(DESTDIR)/etc/cockpit-podman/lifecycle-bootstrap/
 	mkdir -p $(DESTDIR)$(PREFIX)/share/metainfo/
 	msgfmt --xml -d po \
 		--template $(APPSTREAMFILE) \

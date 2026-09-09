@@ -35,6 +35,7 @@ const _ = cockpit.gettext;
 
 const errorText = error => error?.message || error?.toString() || "Unknown error";
 const FULL_CONTAINER_ID = /^[0-9a-f]{64}$/;
+const FULL_SHA256 = /^[0-9a-f]{64}$/;
 const SCHEDULER_SCHEMA = "train-health-scheduler-coverage/v1";
 const SCHEDULER_FAILURE = "scheduler-collector-failed";
 const SCHEDULER_INCOMPLETE = "scheduler-coverage-incomplete";
@@ -77,15 +78,29 @@ const lifecycleMetadataFromRecord = record => ({
     provenance: record.provenance,
 });
 
+const lifecycleRunningState = container => {
+    if (typeof container?.State === "string")
+        return container.State.toLowerCase() === "running";
+    if (container?.State && typeof container.State.Running === "boolean")
+        return container.State.Running;
+    const status = typeof container?.State?.Status === "string"
+        ? container.State.Status
+        : typeof container?.Status === "string" ? container.Status : null;
+    if (status)
+        return status.toLowerCase() === "running" || /^up\b/i.test(status);
+    return null;
+};
+
 const lifecycleRecordsFromOutput = (output, containers, contextUid) => {
     if (!output || typeof output !== "object" || Array.isArray(output) ||
         output.schema !== LIFECYCLE_SCHEMA || typeof output.host !== "string" ||
         !lifecycleRecordText(output.host) || !Number.isInteger(output.record_count) ||
         output.record_count < 0 || !Array.isArray(output.records) ||
+        !FULL_SHA256.test(output.manifest_sha256) ||
         output.record_count !== output.records.length)
         return null;
     const transportHost = cockpit.transport?.host;
-    if (typeof transportHost === "string" && transportHost.length > 0 && output.host !== transportHost)
+    if (typeof transportHost !== "string" || transportHost.length === 0 || output.host !== transportHost)
         return null;
 
     const observed = Date.parse(output.observed_at);
@@ -96,18 +111,22 @@ const lifecycleRecordsFromOutput = (output, containers, contextUid) => {
     const context = lifecycleContext(contextUid);
     if (!LIFECYCLE_CONTEXTS.has(context))
         return null;
-    const currentIds = new Set(containers.map(container => container.Id));
+    const currentById = new Map(containers.map(container => [container.Id, container]));
     const records = new Map();
     for (const record of output.records) {
         if (!record || typeof record !== "object" || Array.isArray(record) ||
             record.host !== output.host || record.context !== context || record.uid !== contextUid ||
             typeof record.id !== "string" || !FULL_CONTAINER_ID.test(record.id) ||
-            !currentIds.has(record.id) || !LIFECYCLE_DISPOSITIONS.has(record.disposition) ||
+            !currentById.has(record.id) || lifecycleRunningState(currentById.get(record.id)) !== false ||
+            !LIFECYCLE_DISPOSITIONS.has(record.disposition) ||
             !lifecycleRecordText(record.reason))
             return null;
         const provenance = record.provenance;
         if (!provenance || typeof provenance !== "object" || Array.isArray(provenance) ||
-            provenance.kind !== "source" || !lifecycleRecordText(provenance.source))
+            provenance.kind !== "source" || provenance.source !== "source-decisions.json" ||
+            !lifecycleRecordText(provenance.source_ref) ||
+            provenance.owner_verified !== true || provenance.manifest_sha256 !== output.manifest_sha256 ||
+            !FULL_SHA256.test(provenance.decision_sha256))
             return null;
         if (records.has(record.id))
             return null;
@@ -116,7 +135,7 @@ const lifecycleRecordsFromOutput = (output, containers, contextUid) => {
     return { host: output.host, observedAt: observed, records };
 };
 
-const containerFromInventory = (inventory, uid, key, current = null) => {
+const containerFromInventory = (inventory, uid, key, current = null, trustedLifecycle = undefined) => {
     const inventoryState = typeof inventory?.State === "string"
         ? { Status: inventory.State.toLowerCase() }
         : (inventory?.State || {});
@@ -147,15 +166,19 @@ const containerFromInventory = (inventory, uid, key, current = null) => {
         ...(current?.NetworkSettings || {}),
         Ports: current?.NetworkSettings?.Ports || inventory.NetworkSettings?.Ports || {},
     };
-    const lifecycleDisposition = Object.prototype.hasOwnProperty.call(inventory, "LifecycleDisposition")
-        ? inventory.LifecycleDisposition
-        : current?.LifecycleDisposition;
-    const host = Object.prototype.hasOwnProperty.call(inventory, "lifecycleHost")
-        ? inventory.lifecycleHost
-        : current?.host;
-    const context = Object.prototype.hasOwnProperty.call(inventory, "lifecycleContext")
-        ? inventory.lifecycleContext
-        : current?.context || (uid === 0 ? "rootful" : "rootless");
+    // Podman inventory and inspect payloads are untrusted lifecycle inputs.
+    // Only the collector result supplied by the caller may attach a record;
+    // an omitted argument preserves a previously verified record while the
+    // first inventory render is waiting for that collector.
+    const lifecycleDisposition = trustedLifecycle === undefined
+        ? current?.LifecycleDisposition || null
+        : trustedLifecycle;
+    const host = trustedLifecycle === undefined
+        ? current?.host || null
+        : trustedLifecycle?.host || null;
+    const context = trustedLifecycle === undefined
+        ? current?.context || (uid === 0 ? "rootful" : "rootless")
+        : trustedLifecycle?.context || (uid === 0 ? "rootful" : "rootless");
     return {
         ...inventory,
         ...(current || {}),
@@ -574,35 +597,37 @@ class Application extends React.Component {
             const key = makeKey(con.uid, id);
             const enrichedInventory = inventoryWithLifecycle.get(id) || inventory;
             const result = resultByKey.get(key);
+            const record = lifecycleById.get(id);
+            const trustedLifecycle = record ? lifecycleMetadataFromRecord(record) : null;
             if (result?.error) {
                 const old = this.state.containers?.[key] || null;
-                const failed = containerFromInventory(enrichedInventory, con.uid, key, old);
+                const failed = containerFromInventory(enrichedInventory, con.uid, key, old, trustedLifecycle);
                 failed.healthDetailsLoaded = false;
                 snapshot.push(failed);
                 errors[key] = errorText(result.error);
             } else if (result && !isValidHealthDetails(inventory, result.detail)) {
                 const old = this.state.containers?.[key] || null;
-                const failed = containerFromInventory(enrichedInventory, con.uid, key, old);
+                const failed = containerFromInventory(enrichedInventory, con.uid, key, old, trustedLifecycle);
                 failed.healthDetailsLoaded = false;
                 snapshot.push(failed);
                 errors[key] = CONTAINER_INSPECT_INVALID;
             } else if (result?.detail) {
-                const record = lifecycleById.get(id);
                 const detail = {
                     ...result.detail,
                     uid: con.uid,
                     key,
-                    host: lifecycleHost || result.detail.host,
+                    host: lifecycleHost,
                     context,
-                    LifecycleDisposition: record
-                        ? lifecycleMetadataFromRecord(record)
-                        : result.detail.LifecycleDisposition,
+                    // Only the verified collector may attach lifecycle
+                    // metadata. Podman inspect payloads and labels are not
+                    // lifecycle evidence.
+                    LifecycleDisposition: record ? lifecycleMetadataFromRecord(record) : null,
                 };
                 detail.healthDetailsLoaded = true;
                 snapshot.push(detail);
             } else {
                 const old = this.state.containers?.[key] || null;
-                snapshot.push(containerFromInventory(enrichedInventory, con.uid, key, old));
+                snapshot.push(containerFromInventory(enrichedInventory, con.uid, key, old, trustedLifecycle));
             }
         }
 
@@ -1252,11 +1277,12 @@ class Application extends React.Component {
                     details.uid = con.uid;
                     details.key = key;
                     const lifecycleDisposition = this.state.lifecycleDispositions?.[key];
-                    if (lifecycleDisposition) {
-                        details.LifecycleDisposition = lifecycleDisposition;
-                        details.host = lifecycleDisposition.host;
-                        details.context = lifecycleDisposition.context;
-                    }
+                    // Inspect data cannot supply lifecycle evidence. Clear
+                    // any arbitrary field and add back only the verified
+                    // collector record kept in application state.
+                    details.LifecycleDisposition = lifecycleDisposition || null;
+                    details.host = lifecycleDisposition?.host || null;
+                    details.context = lifecycleDisposition?.context || lifecycleContext(this.schedulerUid(con));
                     details.healthDetailsLoaded = true;
                     // HACK: during restart State never changes from "running"
                     //       override it to reconnect console after restart

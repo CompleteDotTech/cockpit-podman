@@ -197,7 +197,7 @@ exitedSuccessfully.State.ExitCode = 0;
 assert.equal(healthAssessment(exitedSuccessfully, now, null, fixtures.stopped.scheduler).status, healthStates.stopped);
 
 const completedOneShot = structuredClone(exitedSuccessfully);
-completedOneShot.Config.Labels = { "com.docker.compose.oneoff": "True" };
+completedOneShot.OneShot = true;
 assert.equal(healthAssessment(completedOneShot, now, null, fixtures.stopped.scheduler).status, healthStates.completed);
 assert.equal(healthAssessment(completedOneShot, now, "inventory refresh timed out", fixtures.stopped.scheduler).status,
              healthStates.completed);
@@ -214,12 +214,21 @@ assert.equal(healthAssessment(restartPolicyOnly, now, null, fixtures.stopped.sch
 // the current full container identity. It is lifecycle metadata, not a health
 // result, and it never overrides a running container.
 const dispositionIdentity = {
-    id: "stopped-id",
+    id: "b".repeat(64),
     uid: 0,
     host: "train.home.complete.tech",
     context: "rootful",
 };
+const sourceProvenance = {
+    kind: "source",
+    source: "source-decisions.json",
+    source_ref: "source-ledger-row",
+    owner_verified: true,
+    manifest_sha256: "c".repeat(64),
+    decision_sha256: "d".repeat(64),
+};
 const completedFromMetadata = structuredClone(exitedSuccessfully);
+completedFromMetadata.Id = dispositionIdentity.id;
 completedFromMetadata.uid = 0;
 completedFromMetadata.host = "train.home.complete.tech";
 completedFromMetadata.context = "rootful";
@@ -227,12 +236,20 @@ completedFromMetadata.LifecycleDisposition = {
     ...dispositionIdentity,
     class: "completed_one_shot",
     reason: "bootstrap job completed and is not a live workload",
-    evidence: "recovery-ledger",
+    provenance: sourceProvenance,
 };
 assert.equal(lifecycleDisposition(completedFromMetadata)?.class, "completed_one_shot");
 assert.equal(healthAssessment(completedFromMetadata, now, null, fixtures.stopped.scheduler).status, healthStates.completed);
 assert.equal(healthAssessment(completedFromMetadata, now, null, fixtures.stopped.scheduler).disposition.reason,
              "bootstrap job completed and is not a live workload");
+
+const missingProvenanceReference = structuredClone(completedFromMetadata);
+delete missingProvenanceReference.LifecycleDisposition.provenance.source_ref;
+assert.equal(lifecycleDisposition(missingProvenanceReference), null);
+
+const missingCurrentState = structuredClone(completedFromMetadata);
+missingCurrentState.State = {};
+assert.equal(lifecycleDisposition(missingCurrentState), null);
 
 for (const [label, mismatch] of [
     ["full ID", { ...dispositionIdentity, id: "different-id" }],
@@ -253,6 +270,7 @@ retiredFromMetadata.LifecycleDisposition = {
     ...dispositionIdentity,
     class: "retired",
     reason: "replaced by an active rootless service",
+    provenance: sourceProvenance,
 };
 assert.equal(healthAssessment(retiredFromMetadata, now, "inventory refresh timed out", fixtures.stopped.scheduler).status,
              healthStates.retired);
@@ -271,6 +289,7 @@ staleRetirement.State.Health = {
     Status: "healthy",
     Log: [{ Start: "2026-09-08T12:00:30Z", End: "2026-09-08T12:00:31Z", ExitCode: 0 }],
 };
+assert.equal(lifecycleDisposition(staleRetirement), null);
 assert.equal(healthAssessment(staleRetirement, now, null, fixtures.healthy.scheduler).status, healthStates.healthy);
 
 const infrastructure = structuredClone(staleRetirement);
@@ -278,21 +297,24 @@ infrastructure.LifecycleDisposition = {
     ...dispositionIdentity,
     class: "infrastructure_only",
     reason: "Podman infrastructure container",
+    provenance: sourceProvenance,
 };
 assert.equal(healthAssessment(infrastructure, now, null, fixtures.healthy.scheduler).status,
-             healthStates.infrastructure);
+             healthStates.healthy);
 const runtimeInfrastructure = structuredClone(staleRetirement);
 runtimeInfrastructure.IsInfra = true;
 delete runtimeInfrastructure.LifecycleDisposition;
 assert.equal(healthAssessment(runtimeInfrastructure, now, null, fixtures.healthy.scheduler).status,
-             healthStates.infrastructure);
+             healthStates.healthy);
+assert.equal(healthAssessment(runtimeInfrastructure, now, null, fixtures.healthy.scheduler).role,
+             "infrastructure");
 
 const labelCompleted = structuredClone(exitedSuccessfully);
 labelCompleted.Config.Labels = {
     "com.complete.tech.lifecycle.disposition": "completed_one_shot",
     "com.complete.tech.lifecycle.reason": "owner-declared one-shot",
 };
-assert.equal(healthAssessment(labelCompleted, now, null, fixtures.stopped.scheduler).status, healthStates.completed);
+assert.equal(healthAssessment(labelCompleted, now, null, fixtures.stopped.scheduler).status, healthStates.stopped);
 
 const labelShortName = structuredClone(exitedSuccessfully);
 labelShortName.Config.Labels = { "com.complete.tech.lifecycle.disposition": "completed" };
@@ -303,7 +325,7 @@ retainedFixture.Config.Labels = {
     "com.complete.tech.lifecycle.disposition": "retired",
     "com.complete.tech.lifecycle.reason": "retained fixture; no live service",
 };
-assert.equal(healthAssessment(retainedFixture, now, null, fixtures.stopped.scheduler).status, healthStates.retired);
+assert.equal(healthAssessment(retainedFixture, now, null, fixtures.stopped.scheduler).status, healthStates.stopped);
 
 const sourceRecordId = "a".repeat(64);
 const sourceStopped = structuredClone(exitedSuccessfully);
@@ -315,7 +337,7 @@ sourceStopped.LifecycleDisposition = {
     host: "train.home.complete.tech",
     context: "rootful",
     reason: "owner evidence is insufficient to call this retired",
-    provenance: { kind: "source", source: "ops/fleet-recovery-20260907.md" },
+    provenance: sourceProvenance,
 };
 sourceStopped.uid = 0;
 sourceStopped.host = "train.home.complete.tech";

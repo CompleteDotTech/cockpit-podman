@@ -1,62 +1,78 @@
 #!/usr/bin/env python3
-"""Project the sanitized Train coverage ledger into Cockpit lifecycle records.
+"""Read and project the protected lifecycle bootstrap packet.
 
-The coverage ledger is the source of owner intent.  This helper only reads it;
-it never inspects, starts, stops, or changes a container.  The browser joins
-the records on the current host, owner context, UID, and full container ID.
+The packet is generated from a private Podman capture, a Cockpit display
+snapshot, and the ownership evidence for the same full IDs.  This process is
+read-only: it never invokes Podman, starts a container, or changes a host.
+Every file in the packet is hash-checked before any record is emitted.
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
+import os
 import re
+import socket
 import sys
 from pathlib import Path
 from typing import Any
 
 
 SCHEMA = "cockpit-podman-lifecycle/v1"
-LEDGER_SCHEMA = "podman-health-coverage-ledger.v1"
+PACKET_SCHEMA = "cockpit-podman-lifecycle-bootstrap/v1"
+MANIFEST_SCHEMA = "cockpit-podman-lifecycle-manifest/v1"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 TEXT_MAX = 240
 CONTEXTS = {"rootful", "rootless"}
-
-# These classes are owner statements from fleet-recovery-20260907.md.  They
-# are deliberately mapped to one small public vocabulary; the source class is
-# retained in provenance for auditability.
-RETIRED_CLASSES = {
-    "retained_build_helper",
-    "retained_created_fixture",
-    "retained_host_service_replacement",
-    "retained_replaced_service",
-    "retained_service",
-    "retained_stopped_object",
-    "retained_test_fixture",
-    "retained_validation_fixture",
-    "retired",
-    "retired_model",
-    "retired_service",
+DISPOSITIONS = {"completed_one_shot", "retired", "infrastructure_only", "stopped"}
+EXPECTED_RECORD_COUNT = 24
+EXPECTED_COUNTS = {
+    "completed_one_shot": 3,
+    "retired": 20,
+    "infrastructure_only": 0,
+    "stopped": 1,
 }
+# This is deliberately pinned in code.  A caller cannot replace both the
+# packet and its manifest without also changing the reviewed collector.
+BOOTSTRAP_MANIFEST_SHA256 = "4d2aced182edd5d7ae320a8c4686839d1b90810bdbad5e3e0459f71226cf4e47"
+SOURCE_LEDGER_SHA256 = "b58d2c2b95f46efc3cbd4fdf3b2c62a0024190c091d668e0a6f754d553ee4f81"
+DEFAULT_PACKET = "/etc/cockpit-podman/lifecycle-bootstrap/lifecycle-bootstrap.json"
 
 
 class RecordError(ValueError):
     """Raised when source data cannot safely produce lifecycle records."""
 
 
-def safe_text(value: Any, field: str) -> str:
+def canonical(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def file_digest(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise RecordError(f"cannot read bootstrap file: {path.name}") from exc
+
+
+def safe_text(value: Any, field: str, limit: int = TEXT_MAX) -> str:
     if not isinstance(value, str):
         raise RecordError(f"{field} is not text")
     value = value.strip()
-    if not value or len(value) > TEXT_MAX or re.search(r"[\x00-\x1f\x7f]", value):
+    if not value or len(value) > limit or re.search(r"[\x00-\x1f\x7f]", value):
         raise RecordError(f"{field} is empty or unsafe")
     if re.search(r"https?://", value, flags=re.IGNORECASE):
         raise RecordError(f"{field} contains a URL")
     return value
 
 
-def full_id(value: Any, field: str) -> str:
+def full_id(value: Any, field: str = "id") -> str:
     if not isinstance(value, str) or not HEX64.fullmatch(value):
         raise RecordError(f"{field} is not a full container ID")
     return value
@@ -71,23 +87,169 @@ def observed_at(value: Any) -> str:
     return text
 
 
-def canonical_disposition(source_class: Any) -> str | None:
-    if not isinstance(source_class, str):
-        raise RecordError("lifecycle disposition class is not text")
-    normalized = source_class.strip().lower().replace("-", "_")
-    if normalized == "active_workload":
-        return None
-    if normalized == "completed_one_shot":
-        return "completed_one_shot"
-    if normalized in RETIRED_CLASSES:
-        return "retired"
-    if normalized in {"infrastructure", "infrastructure_only", "infra", "infra_only"}:
-        return "infrastructure_only"
-    # An unidentified retained object is intentionally visible as stopped.
-    # It has no owner evidence for a stronger retired claim.
-    if normalized in {"retained_unknown_exited", "stopped"}:
-        return "stopped"
-    raise RecordError(f"unsupported lifecycle class: {normalized}")
+def authoritative_host() -> str:
+    """Return the host identity supplied by the operating system.
+
+    An empty hostname, localhost placeholder, or unqualified local identity
+    is insufficient for a cross-host lifecycle join.  There is no fallback to
+    a packet value or unchecked transport field.
+    """
+
+    host = socket.getfqdn().strip().lower()
+    if not host or host in {"localhost", "localhost.localdomain"} or "." not in host:
+        raise RecordError("authoritative system hostname is unavailable")
+    return safe_text(host, "authoritative host", 253)
+
+
+def load_json(path: Path) -> Any:
+    try:
+        with path.open(encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RecordError(f"invalid bootstrap JSON: {path.name}") from exc
+
+
+def source_key(row: dict[str, Any]) -> tuple[str, int, str]:
+    context = row.get("context")
+    uid = row.get("uid")
+    identifier = full_id(row.get("id"))
+    if context not in CONTEXTS or isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
+        raise RecordError("source identity is invalid")
+    return context, uid, identifier
+
+
+def verify_source_record(row: Any, host: str, expected: tuple[str, int, str], require_nonrunning: bool = False) -> tuple[str, int, str]:
+    if not isinstance(row, dict):
+        raise RecordError("source row is not an object")
+    key = source_key(row)
+    if key != expected or row.get("host") != host or (require_nonrunning and row.get("running") is not False):
+        raise RecordError("source row identity or running state mismatch")
+    return key
+
+
+def verify_bootstrap(packet_path: Path, expected_manifest: str = BOOTSTRAP_MANIFEST_SHA256) -> tuple[dict[str, Any], str]:
+    """Verify the packet, all source files, and every source row binding."""
+
+    packet = load_json(packet_path)
+    if not isinstance(packet, dict) or packet.get("schema") != PACKET_SCHEMA:
+        raise RecordError("unsupported lifecycle bootstrap schema")
+    packet_dir = packet_path.parent
+    manifest_name = packet.get("source_manifest")
+    if manifest_name != "manifest.json":
+        raise RecordError("bootstrap manifest name is not canonical")
+    manifest_path = packet_dir / manifest_name
+    manifest = load_json(manifest_path)
+    manifest_digest = file_digest(manifest_path)
+    if expected_manifest and manifest_digest != expected_manifest:
+        raise RecordError("bootstrap manifest digest does not match reviewed packet")
+    if not isinstance(manifest, dict) or manifest.get("schema") != MANIFEST_SCHEMA:
+        raise RecordError("unsupported lifecycle manifest schema")
+    if manifest.get("packet") != "lifecycle-bootstrap.json":
+        raise RecordError("manifest packet name is not canonical")
+    if manifest.get("host") != packet.get("host") or manifest.get("observed_at") != packet.get("observed_at"):
+        raise RecordError("packet and manifest identity differ")
+    if manifest.get("record_count") != EXPECTED_RECORD_COUNT or manifest.get("counts") != EXPECTED_COUNTS:
+        raise RecordError("manifest record contract is not the protected 24-row contract")
+    if manifest.get("source_ledger_sha256") != SOURCE_LEDGER_SHA256:
+        raise RecordError("manifest source ledger digest is not the reviewed capture")
+
+    listed = manifest.get("source_files")
+    if not isinstance(listed, list):
+        raise RecordError("manifest source files are missing")
+    expected_files = {"lifecycle-bootstrap.json", "source-inventory.json", "source-display.json",
+                      "source-ownership.json", "source-decisions.json"}
+    actual_files = {entry.get("path") for entry in listed if isinstance(entry, dict)}
+    if actual_files != expected_files or len(listed) != len(expected_files):
+        raise RecordError("manifest source file set is not canonical")
+    for entry in listed:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or "/" in entry["path"] or "\\" in entry["path"]:
+            raise RecordError("manifest contains an unsafe path")
+        source_path = packet_dir / entry["path"]
+        if file_digest(source_path) != entry.get("sha256"):
+            raise RecordError(f"source digest mismatch: {entry['path']}")
+        if entry["path"] == "lifecycle-bootstrap.json" and source_path != packet_path:
+            raise RecordError("packet path does not match manifest")
+
+    host = safe_text(packet.get("host"), "host", 253).lower()
+    observed = observed_at(packet.get("observed_at"))
+    records = packet.get("records")
+    if not isinstance(records, list) or packet.get("record_count") != len(records):
+        raise RecordError("bootstrap record count is invalid")
+    if len(records) != EXPECTED_RECORD_COUNT or packet.get("counts") != EXPECTED_COUNTS:
+        raise RecordError("bootstrap is not the protected 24-row packet")
+
+    sources: dict[str, dict[tuple[str, int, str], dict[str, Any]]] = {}
+    expected_schemas = {
+        "source-inventory.json": "cockpit-podman-lifecycle-source-inventory/v1",
+        "source-display.json": "cockpit-podman-lifecycle-source-display/v1",
+        "source-ownership.json": "cockpit-podman-lifecycle-source-ownership/v1",
+        "source-decisions.json": "cockpit-podman-lifecycle-source-decisions/v1",
+    }
+    for name, schema in expected_schemas.items():
+        source = load_json(packet_dir / name)
+        if not isinstance(source, dict) or source.get("schema") != schema or source.get("host") != host or source.get("observed_at") != observed:
+            raise RecordError(f"invalid source artifact: {name}")
+        rows = source.get("records")
+        if not isinstance(rows, list) or len(rows) != EXPECTED_RECORD_COUNT:
+            raise RecordError(f"invalid source row count: {name}")
+        by_key: dict[tuple[str, int, str], dict[str, Any]] = {}
+        for row in rows:
+            key = verify_source_record(row, host, source_key(row), name in {"source-inventory.json", "source-display.json"})
+            if key in by_key:
+                raise RecordError(f"duplicate source identity: {name}")
+            by_key[key] = row
+        sources[name] = by_key
+
+    source_ledger = load_json(packet_dir / "source-decisions.json").get("source_ledger")
+    if not isinstance(source_ledger, dict) or source_ledger.get("artifact") != "coverage-ledger-8d2c216-0131.json" or \
+            source_ledger.get("sha256") != SOURCE_LEDGER_SHA256:
+        raise RecordError("source ledger evidence digest is not pinned")
+
+    seen: set[tuple[str, int, str]] = set()
+    actual_counts = {name: 0 for name in EXPECTED_COUNTS}
+    for record in records:
+        if not isinstance(record, dict):
+            raise RecordError("bootstrap record is not an object")
+        key = source_key(record)
+        if key in seen:
+            raise RecordError("duplicate lifecycle identity")
+        seen.add(key)
+        verify_source_record(record, host, key, True)
+        disposition = record.get("disposition")
+        if disposition not in DISPOSITIONS:
+            raise RecordError("unsupported canonical disposition")
+        actual_counts[disposition] += 1
+        reason = safe_text(record.get("reason"), "lifecycle reason")
+        provenance = record.get("provenance")
+        if not isinstance(provenance, dict) or provenance.get("kind") != "source" or provenance.get("source") != "source-decisions.json":
+            raise RecordError("lifecycle record provenance is not source-bound")
+        safe_text(provenance.get("source_ref"), "source reference")
+        if provenance.get("owner_verified") is not True:
+            raise RecordError("lifecycle record lacks verified source ownership")
+
+        inventory = sources["source-inventory.json"][key]
+        display = sources["source-display.json"][key]
+        ownership = sources["source-ownership.json"][key]
+        decision = sources["source-decisions.json"][key]
+        if record.get("name") != inventory.get("name") or record.get("name") != display.get("name"):
+            raise RecordError("source names do not agree")
+        if record.get("decision_sha256") != digest(decision):
+            raise RecordError("lifecycle record decision digest mismatch")
+        if decision.get("inventory_row_sha256") != digest(inventory) or \
+                decision.get("display_row_sha256") != digest(display) or \
+                decision.get("ownership_row_sha256") != digest(ownership):
+            raise RecordError("source row digest binding mismatch")
+        if decision.get("disposition") != disposition or decision.get("reason") != reason or \
+                decision.get("owner_verified") is not True or ownership.get("owner_verified") is not True:
+            raise RecordError("source decision does not agree with packet")
+        if display.get("running") is not False or inventory.get("running") is not False:
+            raise RecordError("source evidence is running")
+        safe_text(decision.get("source_class"), "source class", 96)
+        safe_text(decision.get("source_ref"), "source reference")
+
+    if actual_counts != EXPECTED_COUNTS or len(seen) != EXPECTED_RECORD_COUNT:
+        raise RecordError("source packet counts do not match protected contract")
+    return {"schema": PACKET_SCHEMA, "host": host, "observed_at": observed, "records": records}, manifest_digest
 
 
 def stdin_identity() -> tuple[int | None, set[str] | None]:
@@ -98,89 +260,57 @@ def stdin_identity() -> tuple[int | None, set[str] | None]:
         data = json.loads(payload)
     except json.JSONDecodeError as exc:
         raise RecordError("identity input is not JSON") from exc
-    if not isinstance(data, dict):
-        raise RecordError("identity input is not an object")
-
+    if not isinstance(data, dict) or set(data) - {"uid", "ids"}:
+        raise RecordError("identity input has unsupported fields")
     uid = data.get("uid")
-    if uid is not None and (isinstance(uid, bool) or not isinstance(uid, int) or uid < 0):
+    if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
         raise RecordError("identity UID is invalid")
     ids = data.get("ids")
-    if ids is None and isinstance(data.get("containers"), list):
-        ids = [row.get("id") for row in data["containers"] if isinstance(row, dict)]
-    if ids is None:
-        return uid, None
     if not isinstance(ids, list):
         raise RecordError("identity IDs are not a list")
     result = {full_id(value, "identity ID") for value in ids}
     return uid, result
 
 
-def project(ledger: Any, requested_uid: int | None = None,
-            requested_ids: set[str] | None = None) -> dict[str, Any]:
-    if not isinstance(ledger, dict) or ledger.get("schema") != LEDGER_SCHEMA:
-        raise RecordError("unsupported coverage ledger schema")
-    host = safe_text(ledger.get("host"), "host")
-    observed = observed_at(ledger.get("observed_at"))
-    rows = ledger.get("rows")
-    if not isinstance(rows, list):
-        raise RecordError("ledger rows are not a list")
+def project(packet: dict[str, Any], requested_uid: int, requested_ids: set[str] | None = None,
+            authoritative: str | None = None, runtime_uid: int | None = None,
+            manifest_digest: str | None = None) -> dict[str, Any]:
+    """Project verified packet rows for one authoritative owner context."""
 
-    records: list[dict[str, Any]] = []
-    seen: set[tuple[str, int, str]] = set()
-    for row in rows:
-        if not isinstance(row, dict):
-            raise RecordError("ledger row is not an object")
-        row_host = safe_text(row.get("host"), "row host")
-        if row_host != host:
-            raise RecordError("row host does not match ledger host")
-        context = row.get("context")
-        if context not in CONTEXTS:
-            raise RecordError("row context is invalid")
-        uid = row.get("uid")
-        if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
-            raise RecordError("row UID is invalid")
-        if requested_uid is not None and uid != requested_uid:
+    if authoritative is None:
+        authoritative = authoritative_host()
+    if packet.get("host") != authoritative.lower():
+        raise RecordError("bootstrap host does not match authoritative system host")
+    if runtime_uid is None:
+        runtime_uid = os.getuid()
+    if requested_uid != runtime_uid:
+        raise RecordError("requested owner UID does not match process owner")
+    if manifest_digest is None:
+        manifest_digest = BOOTSTRAP_MANIFEST_SHA256
+    records = []
+    for row in packet["records"]:
+        if row["uid"] != requested_uid:
             continue
-        identifier = full_id(row.get("id"), "row ID")
-        if requested_ids is not None and identifier not in requested_ids:
+        if requested_ids is not None and row["id"] not in requested_ids:
             continue
-        key = (context, uid, identifier)
-        if key in seen:
-            raise RecordError("duplicate lifecycle identity")
-        seen.add(key)
-
-        lifecycle = row.get("lifecycle")
-        if not isinstance(lifecycle, dict):
-            raise RecordError("row lifecycle is not an object")
-        disposition = lifecycle.get("disposition")
-        if not isinstance(disposition, dict):
-            raise RecordError("row lifecycle disposition is not an object")
-        canonical = canonical_disposition(disposition.get("class"))
-        if canonical is None:
-            continue
-        if lifecycle.get("running") is not False:
-            raise RecordError("non-active lifecycle record is still running")
-        reason = safe_text(disposition.get("reason"), "lifecycle reason")
-        evidence = safe_text(disposition.get("evidence"), "lifecycle evidence")
+        provenance = dict(row["provenance"])
+        provenance["manifest_sha256"] = manifest_digest
+        provenance["decision_sha256"] = row["decision_sha256"]
         records.append({
-            "host": host,
-            "context": context,
-            "uid": uid,
-            "id": identifier,
-            "disposition": canonical,
-            "reason": reason,
-            "provenance": {
-                "kind": "source",
-                "source": evidence,
-                "source_class": safe_text(disposition.get("class"), "source class"),
-            },
+            "host": row["host"],
+            "context": row["context"],
+            "uid": row["uid"],
+            "id": row["id"],
+            "disposition": row["disposition"],
+            "reason": row["reason"],
+            "provenance": provenance,
         })
-
     records.sort(key=lambda record: (record["context"], record["uid"], record["id"]))
     return {
         "schema": SCHEMA,
-        "host": host,
-        "observed_at": observed,
+        "host": packet["host"],
+        "observed_at": packet["observed_at"],
+        "manifest_sha256": manifest_digest,
         "record_count": len(records),
         "records": records,
     }
@@ -188,19 +318,18 @@ def project(ledger: Any, requested_uid: int | None = None,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", default="/etc/cockpit-podman/lifecycle-ledger.json",
-                        help="sanitized podman-health-coverage-ledger.v1 JSON")
-    parser.add_argument("--uid", type=int, help="limit output to one Podman owner UID")
+    parser.add_argument("--input", default=DEFAULT_PACKET, help="verified lifecycle bootstrap packet")
+    parser.add_argument("--uid", type=int, required=True, help="one Podman owner UID")
     args = parser.parse_args(argv)
     try:
         requested_uid, requested_ids = stdin_identity()
-        if args.uid is not None and requested_uid is not None and args.uid != requested_uid:
+        if requested_uid is not None and args.uid != requested_uid:
             raise RecordError("UID argument does not match identity input")
-        requested_uid = args.uid if args.uid is not None else requested_uid
-        with Path(args.input).open(encoding="utf-8") as stream:
-            ledger = json.load(stream)
-        output = project(ledger, requested_uid, requested_ids)
-    except (OSError, json.JSONDecodeError, RecordError) as exc:
+        if requested_uid is None:
+            requested_uid = args.uid
+        packet, manifest_digest = verify_bootstrap(Path(args.input))
+        output = project(packet, requested_uid, requested_ids, authoritative_host(), os.getuid(), manifest_digest)
+    except (OSError, RecordError) as exc:
         print(f"lifecycle disposition collection failed: {exc}", file=sys.stderr)
         return 2
     json.dump(output, sys.stdout, sort_keys=True, separators=(",", ":"))
