@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 
-MANIFEST_SHA256 = "fb4d8feaa66ef30fa723badbe5ddb66607976658bffb75056360c7c36b31a81a"
+MANIFEST_SHA256 = "a7d4c0ac5e3f0a0040ee00ca485b394be6836f8ff170970824cb82f1c183c286"
 SOURCE_LEDGER_SHA256 = "b58d2c2b95f46efc3cbd4fdf3b2c62a0024190c091d668e0a6f754d553ee4f81"
 EXPECTED_FILES = {"lifecycle-bootstrap.json", "manifest.json", "source-inventory.json",
                   "source-display.json", "source-ownership.json", "source-decisions.json"}

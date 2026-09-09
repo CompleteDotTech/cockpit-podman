@@ -31,7 +31,7 @@ sudo python3 packaging/lifecycle-bootstrap/install.py --install \
 
 The installer never calls Podman or systemd.  Rebuild the packet only from a
 fresh private capture, display snapshot, and ownership evidence using
-`build.py`; the builder rejects missing identities, host/context mismatches,
-running rows, unsupported source classes or evidence references, and count
-changes.  Unknown owners remain explicitly policy-classified with
+`build.py` together with the captured authoritative host context; the builder
+rejects missing identities, host/context mismatches, running rows, unsupported
+source classes or evidence references, and count changes.  Unknown owners remain explicitly policy-classified with
 `owner_verified: false`; they are never converted into a concrete owner.

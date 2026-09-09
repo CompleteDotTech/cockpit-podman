@@ -17,6 +17,7 @@ import json
 import os
 import re
 import socket
+import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,11 @@ SCHEMA = "cockpit-podman-lifecycle/v1"
 PACKET_SCHEMA = "cockpit-podman-lifecycle-bootstrap/v1"
 MANIFEST_SCHEMA = "cockpit-podman-lifecycle-manifest/v1"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HOSTNAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$")
+MACHINE_ID = re.compile(r"^[0-9a-f]{32}\n?$", re.IGNORECASE)
 TEXT_MAX = 240
+MACHINE_ID_PATH = Path("/etc/machine-id")
+MACHINE_ID_MAX_BYTES = 128
 CONTEXTS = {"rootful", "rootless"}
 DISPOSITIONS = {"completed_one_shot", "retired", "infrastructure_only", "stopped"}
 POLICY_PROVENANCE_KIND = "operator-policy"
@@ -41,7 +46,7 @@ EXPECTED_COUNTS = {
 }
 # This is deliberately pinned in code.  A caller cannot replace both the
 # packet and its manifest without also changing the reviewed collector.
-BOOTSTRAP_MANIFEST_SHA256 = "fb4d8feaa66ef30fa723badbe5ddb66607976658bffb75056360c7c36b31a81a"
+BOOTSTRAP_MANIFEST_SHA256 = "a7d4c0ac5e3f0a0040ee00ca485b394be6836f8ff170970824cb82f1c183c286"
 SOURCE_LEDGER_SHA256 = "b58d2c2b95f46efc3cbd4fdf3b2c62a0024190c091d668e0a6f754d553ee4f81"
 DEFAULT_PACKET = "/etc/cockpit-podman/lifecycle-bootstrap/lifecycle-bootstrap.json"
 
@@ -94,15 +99,62 @@ def observed_at(value: Any) -> str:
 def authoritative_host() -> str:
     """Return the host identity supplied by the operating system.
 
-    An empty hostname, localhost placeholder, or unqualified local identity
-    is insufficient for a cross-host lifecycle join.  There is no fallback to
-    a packet value or unchecked transport field.
+    An empty hostname or localhost placeholder is insufficient for a
+    cross-host lifecycle join.  There is no fallback to a packet value or
+    unchecked transport field.  The host may be unqualified when that is the
+    authoritative name supplied by the backend.
     """
 
     host = socket.getfqdn().strip().lower()
-    if not host or host in {"localhost", "localhost.localdomain"} or "." not in host:
+    if not host or host in {"localhost", "localhost.localdomain"} or not HOSTNAME.fullmatch(host):
         raise RecordError("authoritative system hostname is unavailable")
     return safe_text(host, "authoritative host", 253)
+
+
+def machine_id_digest() -> str:
+    """Hash the protected, bounded OS machine identity.
+
+    The manifest binds the packet to the host that produced the capture.  A
+    caller supplied hostname or transport alias cannot replace this check.
+    The file is opened without following symlinks, must be a root-owned
+    regular file that is not writable by group or other users, and is read in
+    a bounded loop before its canonical machine-id format is checked.
+    """
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise RecordError("secure machine identity open is unavailable")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+    try:
+        descriptor = os.open(MACHINE_ID_PATH, flags)
+    except OSError as exc:
+        raise RecordError("authoritative machine identity is unavailable") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or \
+                (metadata.st_mode & 0o022) or not (metadata.st_mode & stat.S_IRUSR) or \
+                metadata.st_size <= 0 or metadata.st_size > MACHINE_ID_MAX_BYTES:
+            raise RecordError("authoritative machine identity file is not protected")
+        content = bytearray()
+        while len(content) <= MACHINE_ID_MAX_BYTES:
+            chunk = os.read(descriptor, MACHINE_ID_MAX_BYTES + 1 - len(content))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > MACHINE_ID_MAX_BYTES:
+            raise RecordError("authoritative machine identity is too large")
+    except OSError as exc:
+        raise RecordError("authoritative machine identity cannot be read") from exc
+    finally:
+        os.close(descriptor)
+
+    try:
+        value = bytes(content).decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise RecordError("authoritative machine identity is not ASCII") from exc
+    if not MACHINE_ID.fullmatch(value):
+        raise RecordError("authoritative machine identity has invalid format")
+    return hashlib.sha256(bytes(content)).hexdigest()
 
 
 def load_json(path: Path) -> Any:
@@ -156,6 +208,15 @@ def verify_bootstrap(packet_path: Path, expected_manifest: str = BOOTSTRAP_MANIF
         raise RecordError("manifest record contract is not the protected 24-row contract")
     if manifest.get("source_ledger_sha256") != SOURCE_LEDGER_SHA256:
         raise RecordError("manifest source ledger digest is not the reviewed capture")
+    host_binding = manifest.get("host_binding")
+    if not isinstance(host_binding, dict) or \
+            host_binding.get("hostname") != packet.get("host") or \
+            host_binding.get("fqdn") != packet.get("host") or \
+            not isinstance(host_binding.get("machine_id_sha256"), str) or \
+            not HEX64.fullmatch(host_binding["machine_id_sha256"]):
+        raise RecordError("manifest host binding is not the reviewed host context")
+    if machine_id_digest() != host_binding["machine_id_sha256"]:
+        raise RecordError("manifest host binding does not match this machine")
 
     listed = manifest.get("source_files")
     if not isinstance(listed, list):
@@ -262,15 +323,15 @@ def verify_bootstrap(packet_path: Path, expected_manifest: str = BOOTSTRAP_MANIF
     return {"schema": PACKET_SCHEMA, "host": host, "observed_at": observed, "records": records}, manifest_digest
 
 
-def stdin_identity() -> tuple[int | None, set[str] | None]:
+def stdin_identity() -> tuple[int | None, set[str] | None, str | None]:
     payload = sys.stdin.read()
     if not payload.strip():
-        return None, None
+        return None, None, None
     try:
         data = json.loads(payload)
     except json.JSONDecodeError as exc:
         raise RecordError("identity input is not JSON") from exc
-    if not isinstance(data, dict) or set(data) - {"uid", "ids"}:
+    if not isinstance(data, dict) or set(data) - {"uid", "ids", "host"}:
         raise RecordError("identity input has unsupported fields")
     uid = data.get("uid")
     if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
@@ -279,12 +340,18 @@ def stdin_identity() -> tuple[int | None, set[str] | None]:
     if not isinstance(ids, list):
         raise RecordError("identity IDs are not a list")
     result = {full_id(value, "identity ID") for value in ids}
-    return uid, result
+    host = data.get("host")
+    if host is not None:
+        if not isinstance(host, str) or not HOSTNAME.fullmatch(host.strip()) or \
+                host.strip().lower() in {"localhost", "localhost.localdomain"}:
+            raise RecordError("identity host is invalid")
+        host = host.strip().lower()
+    return uid, result, host
 
 
 def project(packet: dict[str, Any], requested_uid: int, requested_ids: set[str] | None = None,
             authoritative: str | None = None, runtime_uid: int | None = None,
-            manifest_digest: str | None = None) -> dict[str, Any]:
+            manifest_digest: str | None = None, projected_at: str | None = None) -> dict[str, Any]:
     """Project verified packet rows for one authoritative owner context."""
 
     if authoritative is None:
@@ -297,6 +364,7 @@ def project(packet: dict[str, Any], requested_uid: int, requested_ids: set[str] 
         raise RecordError("requested owner UID does not match process owner")
     if manifest_digest is None:
         manifest_digest = BOOTSTRAP_MANIFEST_SHA256
+    projected_at = observed_at(projected_at or dt.datetime.now(dt.timezone.utc).isoformat())
     records = []
     for row in packet["records"]:
         if row["uid"] != requested_uid:
@@ -320,6 +388,7 @@ def project(packet: dict[str, Any], requested_uid: int, requested_ids: set[str] 
         "schema": SCHEMA,
         "host": packet["host"],
         "observed_at": packet["observed_at"],
+        "projected_at": projected_at,
         "manifest_sha256": manifest_digest,
         "record_count": len(records),
         "records": records,
@@ -332,13 +401,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--uid", type=int, required=True, help="one Podman owner UID")
     args = parser.parse_args(argv)
     try:
-        requested_uid, requested_ids = stdin_identity()
+        requested_uid, requested_ids, requested_host = stdin_identity()
         if requested_uid is not None and args.uid != requested_uid:
             raise RecordError("UID argument does not match identity input")
         if requested_uid is None:
             requested_uid = args.uid
         packet, manifest_digest = verify_bootstrap(Path(args.input))
-        output = project(packet, requested_uid, requested_ids, authoritative_host(), os.getuid(), manifest_digest)
+        host = authoritative_host()
+        if requested_host is not None and requested_host != host:
+            raise RecordError("identity host does not match authoritative system host")
+        output = project(packet, requested_uid, requested_ids, host, os.getuid(), manifest_digest)
     except (OSError, RecordError) as exc:
         print(f"lifecycle disposition collection failed: {exc}", file=sys.stderr)
         return 2

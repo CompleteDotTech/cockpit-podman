@@ -21,9 +21,15 @@ assert BUILD_SPEC.loader is not None
 BUILD_SPEC.loader.exec_module(BUILD)
 
 
-HOST = "train.home.complete.tech"
+HOST = "completetrain-b550-gaming-x-v2"
+MACHINE_ID_SHA256 = "7c577a84da00e3b2683cbb782268e70733a3edd59b26794a5ccbd0367e5a2829"
 PACKET_PATH = ROOT / "packaging" / "lifecycle-bootstrap" / "lifecycle-bootstrap.json"
-packet, manifest_digest = MODULE.verify_bootstrap(PACKET_PATH)
+original_machine_id_digest = MODULE.machine_id_digest
+MODULE.machine_id_digest = lambda: MACHINE_ID_SHA256
+try:
+    packet, manifest_digest = MODULE.verify_bootstrap(PACKET_PATH)
+finally:
+    MODULE.machine_id_digest = original_machine_id_digest
 assert manifest_digest == MODULE.BOOTSTRAP_MANIFEST_SHA256
 assert len(packet["records"]) == 24
 assert {record["id"] for record in packet["records"]} == {
@@ -36,6 +42,8 @@ assert {record["provenance"]["source_ref"] for record in packet["records"]} == {
 assert {record["provenance"]["policy_sha256"] for record in packet["records"]} == {MODULE.SOURCE_LEDGER_SHA256}
 assert sum(record["provenance"]["owner_verified"] is True for record in packet["records"]) == 21
 assert sum(record["provenance"]["owner_verified"] is False for record in packet["records"]) == 3
+assert MODULE.project(packet, 0, authoritative=HOST, runtime_uid=0, manifest_digest=manifest_digest,
+                      projected_at="2026-09-09T04:00:00+00:00")["projected_at"] == "2026-09-09T04:00:00+00:00"
 
 rootful = MODULE.project(packet, 0, authoritative=HOST, runtime_uid=0, manifest_digest=manifest_digest)
 rootless = MODULE.project(packet, 1000, authoritative=HOST, runtime_uid=1000, manifest_digest=manifest_digest)
@@ -69,6 +77,12 @@ try:
         pass
     else:
         raise AssertionError("generic identity metadata must fail closed")
+finally:
+    MODULE.sys.stdin = original_stdin
+
+MODULE.sys.stdin = io.StringIO(json.dumps({"uid": 0, "ids": [], "host": HOST}))
+try:
+    assert MODULE.stdin_identity() == (0, set(), HOST)
 finally:
     MODULE.sys.stdin = original_stdin
 
@@ -106,11 +120,14 @@ with tempfile.TemporaryDirectory() as temporary:
     source = json.loads(source_path.read_text())
     source["records"][0]["running"] = True
     source_path.write_text(json.dumps(source, sort_keys=True, separators=(",", ":")) + "\n")
+    MODULE.machine_id_digest = lambda: MACHINE_ID_SHA256
     try:
         MODULE.verify_bootstrap(copy / "lifecycle-bootstrap.json", expected_manifest=manifest_digest)
     except MODULE.RecordError:
         pass
     else:
         raise AssertionError("tampered source evidence must fail digest verification")
+    finally:
+        MODULE.machine_id_digest = original_machine_id_digest
 
 print("lifecycle-disposition 24-row bootstrap fixtures: PASS")

@@ -80,6 +80,24 @@ def load(path: Path) -> Any:
         return json.load(stream)
 
 
+def authoritative_host_context(path: Path) -> dict[str, str]:
+    context = load(path)
+    if not isinstance(context, dict):
+        raise ValueError("authoritative host context is not an object")
+    hostname = text(context.get("hostname"), "authoritative hostname", 253)
+    fqdn = text(context.get("fqdn"), "authoritative FQDN", 253)
+    machine_id_sha256 = context.get("machine_id_sha256")
+    if not HOST_RE.fullmatch(hostname) or not HOST_RE.fullmatch(fqdn) or hostname.lower() != fqdn.lower():
+        raise ValueError("authoritative host context names do not agree")
+    if not isinstance(machine_id_sha256, str) or not HEX64.fullmatch(machine_id_sha256):
+        raise ValueError("authoritative host context machine binding is invalid")
+    return {
+        "hostname": hostname.lower(),
+        "fqdn": fqdn.lower(),
+        "machine_id_sha256": machine_id_sha256,
+    }
+
+
 def owner_from_capture(row: dict[str, Any]) -> dict[str, Any]:
     source = row.get("source_owner")
     if not isinstance(source, dict):
@@ -123,15 +141,17 @@ def build(args: argparse.Namespace) -> None:
     ledger = load(args.ledger)
     capture = load(args.capture)
     display = load(args.display)
+    host_context = authoritative_host_context(args.host_context)
     if ledger.get("schema") != "podman-health-coverage-ledger.v1":
         raise ValueError("unsupported ledger schema")
     if capture.get("schema") != "podman-health-coverage-capture.v1":
         raise ValueError("unsupported capture schema")
     if not isinstance(display, dict) or not isinstance(display.get("rows"), list):
         raise ValueError("unsupported display schema")
-    host = text(ledger.get("host"), "host", 253)
-    if not HOST_RE.fullmatch(host) or host != capture.get("host"):
+    source_host = text(ledger.get("host"), "source host", 253)
+    if not HOST_RE.fullmatch(source_host) or source_host != capture.get("host"):
         raise ValueError("source hosts do not agree")
+    host = host_context["fqdn"]
     if ledger.get("observed_at") != capture.get("observed_at"):
         raise ValueError("source timestamps do not agree")
 
@@ -177,7 +197,7 @@ def build(args: argparse.Namespace) -> None:
         display_row = display_rows.get(identifier)
         if capture_row is None or display_row is None:
             raise ValueError(f"missing source evidence for {identifier}")
-        if row.get("host") != host or capture_row.get("host") != host:
+        if row.get("host") != source_host or capture_row.get("host") != source_host:
             raise ValueError(f"host mismatch for {identifier}")
         if capture_row.get("running") is not False:
             raise ValueError(f"capture says row is running: {identifier}")
@@ -342,6 +362,7 @@ def build(args: argparse.Namespace) -> None:
         "schema": "cockpit-podman-lifecycle-manifest/v1",
         "packet": "lifecycle-bootstrap.json",
         "host": host,
+        "host_binding": host_context,
         "observed_at": ledger["observed_at"],
         "record_count": EXPECTED_ROWS,
         "counts": counts,
@@ -359,6 +380,7 @@ def main() -> int:
     parser.add_argument("--ledger", type=Path, required=True)
     parser.add_argument("--capture", type=Path, required=True)
     parser.add_argument("--display", type=Path, required=True)
+    parser.add_argument("--host-context", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     build(args)

@@ -73,6 +73,9 @@ function isReturnRaw(return_raw: boolean, callback: MonitorCallback): callback i
 
 export type Connection = {
     uid: Uid;
+    // Canonical host identity returned by the Podman backend.  This is kept
+    // separate from Cockpit's transport alias, which may be localhost.
+    host?: string;
     monitor: (path: string, callback: MonitorCallback, return_raw?: boolean) => Promise<void>;
     call: (options: JsonObject) => CancellablePromise<string>;
     close: () => void;

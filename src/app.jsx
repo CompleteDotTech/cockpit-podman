@@ -48,6 +48,7 @@ const HEALTH_INSPECT_CONCURRENCY = 8;
 const HEALTH_SCHEDULER_TIMEOUT_MS = 8000;
 const CONTAINER_INSPECT_INVALID = "Container inspect response is invalid";
 const LIFECYCLE_SCHEMA = "cockpit-podman-lifecycle/v1";
+const LIFECYCLE_HOSTNAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$/;
 const LIFECYCLE_POLICY_SHA256 = "b58d2c2b95f46efc3cbd4fdf3b2c62a0024190c091d668e0a6f754d553ee4f81";
 const LIFECYCLE_POLICY_EVIDENCE_REF = "worktrees/misc-source/train.home.complete.tech/ops/fleet-recovery-20260907.md";
 const LIFECYCLE_COLLECTOR_FAILURE = "lifecycle-disposition-unavailable";
@@ -68,6 +69,10 @@ const lifecycleContext = uid => uid === 0 ? "rootful" : "rootless";
 
 const lifecycleRecordText = value => typeof value === "string" && value.length > 0 && value.length <= 240 &&
     value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value) && !/https?:\/\//i.test(value);
+
+const lifecycleHostText = value => typeof value === "string" && LIFECYCLE_HOSTNAME.test(value.trim()) &&
+    !["localhost", "localhost.localdomain"].includes(value.trim().toLowerCase())
+    ? value.trim().toLowerCase() : null;
 
 const lifecycleMetadataFromRecord = record => ({
     class: record.disposition,
@@ -93,21 +98,20 @@ const lifecycleRunningState = container => {
     return null;
 };
 
-const lifecycleRecordsFromOutput = (output, containers, contextUid) => {
+const lifecycleRecordsFromOutput = (output, containers, contextUid, authoritativeHost) => {
+    const expectedHost = lifecycleHostText(authoritativeHost);
     if (!output || typeof output !== "object" || Array.isArray(output) ||
         output.schema !== LIFECYCLE_SCHEMA || typeof output.host !== "string" ||
         !lifecycleRecordText(output.host) || !Number.isInteger(output.record_count) ||
         output.record_count < 0 || !Array.isArray(output.records) ||
         !FULL_SHA256.test(output.manifest_sha256) ||
-        output.record_count !== output.records.length)
-        return null;
-    const transportHost = cockpit.transport?.host;
-    if (typeof transportHost !== "string" || transportHost.length === 0 || output.host !== transportHost)
+        output.record_count !== output.records.length || output.host !== expectedHost)
         return null;
 
     const observed = Date.parse(output.observed_at);
-    if (!Number.isFinite(observed) || Date.now() - observed > LIFECYCLE_MAX_AGE_MS ||
-        observed - Date.now() > LIFECYCLE_FUTURE_SKEW_MS)
+    const projected = Date.parse(output.projected_at);
+    if (!Number.isFinite(observed) || !Number.isFinite(projected) ||
+        Date.now() - projected > LIFECYCLE_MAX_AGE_MS || projected - Date.now() > LIFECYCLE_FUTURE_SKEW_MS)
         return null;
 
     const context = lifecycleContext(contextUid);
@@ -136,7 +140,7 @@ const lifecycleRecordsFromOutput = (output, containers, contextUid) => {
             return null;
         records.set(record.id, record);
     }
-    return { host: output.host, observedAt: observed, records };
+    return { host: output.host, observedAt: observed, projectedAt: projected, records };
 };
 
 const containerFromInventory = (inventory, uid, key, current = null, trustedLifecycle = undefined) => {
@@ -762,6 +766,7 @@ class Application extends React.Component {
 
         const identity = {
             uid: contextUid,
+            host: con.host,
             ids: containers.map(container => container.Id).filter(id => FULL_CONTAINER_ID.test(id)),
         };
         const owner = this.state.users.find(user => user.uid === con.uid);
@@ -796,7 +801,7 @@ class Application extends React.Component {
                                                         () => process?.close?.()));
             if (refreshRequest && !this.healthRefreshGate.isCurrent(con.uid, refreshRequest))
                 return null;
-            const result = lifecycleRecordsFromOutput(output, containers, contextUid);
+            const result = lifecycleRecordsFromOutput(output, containers, contextUid, con.host);
             if (!result)
                 throw new Error("Lifecycle disposition collector returned an invalid schema");
             this.applyLifecycleDispositions(con, result, refreshRequest);
@@ -1743,6 +1748,10 @@ class Application extends React.Component {
             await cockpit.spawn(start_args, { superuser: uid === null ? null : "require", err: "message", environ });
             con = rest.connect(uid);
             const reply = await client.getInfo(con);
+            const authoritativeHost = lifecycleHostText(reply?.host?.hostname);
+            if (!authoritativeHost)
+                throw new Error("Podman backend host identity is unavailable");
+            con.host = authoritativeHost;
             this.ownerConnections.set(uid, con);
             this.setState(prevState => {
                 const users = prevState.users.filter(u => u.uid !== uid);

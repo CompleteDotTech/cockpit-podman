@@ -15,6 +15,59 @@ const fixture = JSON.parse(await readFile(resolve(here, "scheduler-refresh-fixtu
 // same-UID reconnect. The production guard must run before that stale frame
 // can replace the new connection's pending batch or cancel its timer.
 const applicationSource = await readFile(resolve(here, "../src/app.jsx"), "utf8");
+const lifecycleValidationStart = applicationSource.indexOf("const lifecycleRecordText =");
+const lifecycleValidationEnd = applicationSource.indexOf("\nconst containerFromInventory", lifecycleValidationStart);
+assert.ok(lifecycleValidationStart >= 0 && lifecycleValidationEnd > lifecycleValidationStart);
+const lifecycleRecordsFromOutput = new Function(`
+    const FULL_CONTAINER_ID = /^[0-9a-f]{64}$/;
+    const FULL_SHA256 = /^[0-9a-f]{64}$/;
+    const LIFECYCLE_SCHEMA = "cockpit-podman-lifecycle/v1";
+    const LIFECYCLE_HOSTNAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$/;
+    const LIFECYCLE_POLICY_SHA256 = "b58d2c2b95f46efc3cbd4fdf3b2c62a0024190c091d668e0a6f754d553ee4f81";
+    const LIFECYCLE_POLICY_EVIDENCE_REF = "worktrees/misc-source/train.home.complete.tech/ops/fleet-recovery-20260907.md";
+    const LIFECYCLE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+    const LIFECYCLE_FUTURE_SKEW_MS = 5 * 60 * 1000;
+    const LIFECYCLE_DISPOSITIONS = new Set(["completed_one_shot", "retired", "infrastructure_only", "stopped"]);
+    const LIFECYCLE_CONTEXTS = new Set(["rootful", "rootless"]);
+    const lifecycleContext = uid => uid === 0 ? "rootful" : "rootless";
+    ${applicationSource.slice(lifecycleValidationStart, lifecycleValidationEnd)}
+    return lifecycleRecordsFromOutput;
+`)();
+const lifecycleTestId = "a".repeat(64);
+const lifecycleBackendHost = "completetrain-b550-gaming-x-v2";
+const lifecycleOutput = {
+    schema: "cockpit-podman-lifecycle/v1",
+    host: lifecycleBackendHost,
+    observed_at: "2020-01-01T00:00:00+00:00",
+    projected_at: new Date().toISOString(),
+    manifest_sha256: "b".repeat(64),
+    record_count: 1,
+    records: [{
+        host: lifecycleBackendHost,
+        context: "rootful",
+        uid: 0,
+        id: lifecycleTestId,
+        disposition: "stopped",
+        reason: "explicit policy",
+        provenance: {
+            kind: "operator-policy",
+            source: "source-decisions.json",
+            source_ref: "worktrees/misc-source/train.home.complete.tech/ops/fleet-recovery-20260907.md",
+            policy_sha256: "b58d2c2b95f46efc3cbd4fdf3b2c62a0024190c091d668e0a6f754d553ee4f81",
+            owner_verified: false,
+            manifest_sha256: "b".repeat(64),
+            decision_sha256: "c".repeat(64),
+        },
+    }],
+};
+assert.equal(lifecycleRecordsFromOutput(lifecycleOutput, [{ Id: lifecycleTestId, State: "exited" }], 0,
+                                       lifecycleBackendHost)?.records.size, 1);
+const staleLifecycleOutput = { ...lifecycleOutput,
+    projected_at: new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString() };
+assert.equal(lifecycleRecordsFromOutput(staleLifecycleOutput, [{ Id: lifecycleTestId, State: "exited" }], 0,
+                                       lifecycleBackendHost), null);
+assert.equal(lifecycleRecordsFromOutput(lifecycleOutput, [{ Id: lifecycleTestId, State: "exited" }], 0,
+                                       "localhost"), null);
 // Inventory markers cannot promote an exited row to a completed one-shot.
 const inventoryMapperStart = applicationSource.indexOf("const containerFromInventory =");
 const inventoryMapperEnd = applicationSource.indexOf("\n// sort order", inventoryMapperStart);
