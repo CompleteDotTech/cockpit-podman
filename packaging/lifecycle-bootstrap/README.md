@@ -13,12 +13,17 @@ Verify a source tree without changing a host:
 python3 packaging/lifecycle-bootstrap/install.py --check
 ```
 
-The package install copies the verified JSON files to
-`/etc/cockpit-podman/lifecycle-bootstrap/` as root-owned mode `0644`.  A
-manual installation can use the explicit, privileged operation after review:
+The generic Cockpit package install leaves this site policy untouched. Apply
+the verified JSON files to `/etc/cockpit-podman/lifecycle-bootstrap/` only
+through the explicit target or installer after reviewing the Train host and
+ownership evidence:
 
 ```text
-python3 packaging/lifecycle-bootstrap/install.py --install \
+sudo make install-lifecycle-bootstrap \
+  LIFECYCLE_BOOTSTRAP_DESTINATION=/etc/cockpit-podman/lifecycle-bootstrap
+
+# Equivalent direct command:
+sudo python3 packaging/lifecycle-bootstrap/install.py --install \
   --destination /etc/cockpit-podman/lifecycle-bootstrap
 ```
 

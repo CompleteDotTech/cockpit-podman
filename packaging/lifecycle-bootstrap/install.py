@@ -107,7 +107,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=Path(__file__).parent)
     parser.add_argument("--destination", type=Path, default=Path("/etc/cockpit-podman/lifecycle-bootstrap"))
-    parser.add_argument("--install", action="store_true", help="install after verification; requires root")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--check", action="store_true", help="verify only; this is the default")
+    action.add_argument("--install", action="store_true", help="install after verification; requires root")
     args = parser.parse_args()
     names = verify(args.source)
     if args.install:

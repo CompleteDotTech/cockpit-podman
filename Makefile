@@ -11,6 +11,7 @@ NODE_CACHE=$(RPM_NAME)-node-$(VERSION).tar.xz
 SPEC=$(RPM_NAME).spec
 PREFIX ?= /usr/local
 APPSTREAMFILE=org.cockpit_project.$(PACKAGE_NAME).metainfo.xml
+LIFECYCLE_BOOTSTRAP_DESTINATION ?= /etc/cockpit-podman/lifecycle-bootstrap
 VM_IMAGE=$(CURDIR)/test/images/$(TEST_OS)
 # stamp file to check for node_modules/
 NODE_MODULES_TEST=package-lock.json
@@ -131,18 +132,19 @@ clean:
 install: $(DIST_TEST) po/LINGUAS
 	mkdir -p $(DESTDIR)$(PREFIX)/share/cockpit/$(PACKAGE_NAME)
 	cp -r dist/* $(DESTDIR)$(PREFIX)/share/cockpit/$(PACKAGE_NAME)
-	mkdir -p $(DESTDIR)/etc/cockpit-podman/lifecycle-bootstrap
-	install -m 0644 packaging/lifecycle-bootstrap/manifest.json \
-		packaging/lifecycle-bootstrap/lifecycle-bootstrap.json \
-		packaging/lifecycle-bootstrap/source-inventory.json \
-		packaging/lifecycle-bootstrap/source-display.json \
-		packaging/lifecycle-bootstrap/source-ownership.json \
-		packaging/lifecycle-bootstrap/source-decisions.json \
-		$(DESTDIR)/etc/cockpit-podman/lifecycle-bootstrap/
 	mkdir -p $(DESTDIR)$(PREFIX)/share/metainfo/
 	msgfmt --xml -d po \
 		--template $(APPSTREAMFILE) \
 		-o $(DESTDIR)$(PREFIX)/share/metainfo/$(APPSTREAMFILE)
+
+# The lifecycle packet is a site-specific Train policy. Keep it out of the
+# generic Cockpit package install; apply it only after an explicit review.
+install-lifecycle-bootstrap:
+	python3 packaging/lifecycle-bootstrap/install.py --install \
+		--destination "$(LIFECYCLE_BOOTSTRAP_DESTINATION)"
+
+test-lifecycle-bootstrap-install:
+	python3 test/lifecycle-bootstrap-install.test.py
 
 # this requires a built source tree and avoids having to install anything system-wide
 devel-install: $(DIST_TEST)
@@ -222,4 +224,4 @@ FORCE:
 $(NODE_MODULES_TEST): FORCE tools/node-modules
 	tools/node-modules make_package_lock_json
 
-.PHONY: all clean install devel-install devel-uninstall print-version dist rpm prepare-check check vm print-vm
+.PHONY: all clean install install-lifecycle-bootstrap test-lifecycle-bootstrap-install devel-install devel-uninstall print-version dist rpm prepare-check check vm print-vm
