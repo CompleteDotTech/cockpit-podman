@@ -31,6 +31,7 @@ export const lifecycleDispositionClasses = Object.freeze({
     completed: "completed_one_shot",
     retired: "retired",
     infrastructure: "infrastructure_only",
+    stopped: "stopped",
 });
 
 const LIFECYCLE_DISPOSITION_LABEL = "com.complete.tech.lifecycle.disposition";
@@ -42,21 +43,8 @@ export const lifecycleDispositionLabels = Object.freeze({
     evidence: LIFECYCLE_EVIDENCE_LABEL,
 });
 const LIFECYCLE_CLASSES = new Set(Object.values(lifecycleDispositionClasses));
-const RETIRED_CLASSES = new Set([
-    "retired",
-    "retired_model",
-    "retired_service",
-    "retained",
-    "retained_build_helper",
-    "retained_created_fixture",
-    "retained_replaced_service",
-    "retained_stopped_object",
-    "retained_test_fixture",
-    "retained_unknown_exited",
-    "retained_validation_fixture",
-]);
-const INFRASTRUCTURE_CLASSES = new Set(["infrastructure", "infrastructure_only", "infra", "infra_only", "not_applicable"]);
 const LIFECYCLE_TEXT_MAX_LENGTH = 240;
+const FULL_LIFECYCLE_ID = /^[0-9a-f]{64}$/;
 
 const lifecycleText = value => {
     if (typeof value !== "string" || value.length === 0 || value.length > LIFECYCLE_TEXT_MAX_LENGTH ||
@@ -65,27 +53,18 @@ const lifecycleText = value => {
     return value.trim() || null;
 };
 
-const lifecycleClass = (value, source) => {
+const lifecycleClass = value => {
     if (typeof value !== "string")
         return null;
     const normalized = value.trim().toLowerCase().replace(/-/g, "_");
     if (LIFECYCLE_CLASSES.has(normalized))
         return normalized;
-    // Aliases are accepted only in explicit owner metadata or Podman's direct
-    // infra marker. The display never derives them from names, commands,
-    // images, or exit codes.
-    if ((source === "metadata" || source === "label" || source === "runtime") && RETIRED_CLASSES.has(normalized))
-        return lifecycleDispositionClasses.retired;
-    if ((source === "metadata" || source === "label" || source === "runtime") && INFRASTRUCTURE_CLASSES.has(normalized))
-        return lifecycleDispositionClasses.infrastructure;
-    if (source === "metadata" && normalized === "completed")
-        return lifecycleDispositionClasses.completed;
     return null;
 };
 
 const lifecycleMetadataObject = container => {
     const candidates = [
-        [container?.LifecycleDisposition, "metadata"],
+        [container?.LifecycleDisposition, container?.LifecycleDisposition?.provenance ? "record" : "metadata"],
         [container?.Lifecycle?.Disposition, "metadata"],
         [container?.Lifecycle?.disposition, "metadata"],
         [container?.lifecycle?.disposition, "metadata"],
@@ -133,6 +112,16 @@ const lifecycleIdentityMatches = (container, metadata, source) => {
     const metadataId = metadata.id ?? metadata.container_id ?? metadata.containerId;
     if (metadataId !== container?.Id || typeof metadataId !== "string" || metadataId.length === 0)
         return false;
+    if (source === "record") {
+        if (!FULL_LIFECYCLE_ID.test(metadataId) ||
+            typeof metadata.uid !== "number" || !Number.isInteger(metadata.uid) ||
+            typeof metadata.host !== "string" || metadata.host.length === 0 ||
+            typeof metadata.context !== "string" || metadata.context.length === 0)
+            return false;
+        if (container?.uid !== metadata.uid || container?.host !== metadata.host ||
+            container?.context !== metadata.context)
+            return false;
+    }
     if (metadata.uid !== undefined && metadata.uid !== container?.uid)
         return false;
     for (const [metadataKey, containerKeys] of [
@@ -155,12 +144,12 @@ export const lifecycleDisposition = container => {
     if (!candidate || !lifecycleIdentityMatches(container, candidate.value, candidate.source))
         return null;
 
-    const dispositionClass = lifecycleClass(candidate.value.class, candidate.source);
+    const dispositionClass = lifecycleClass(candidate.value.class);
     if (!dispositionClass)
         return null;
     const metadataId = candidate.value.id ?? candidate.value.container_id ?? candidate.value.containerId;
     const reason = lifecycleText(candidate.value.reason);
-    const evidence = lifecycleText(candidate.value.evidence);
+    const evidence = lifecycleText(candidate.value.evidence ?? candidate.value.provenance?.source);
     return {
         class: dispositionClass,
         reason,

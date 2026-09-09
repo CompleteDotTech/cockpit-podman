@@ -300,10 +300,35 @@ assert.equal(healthAssessment(labelShortName, now, null, fixtures.stopped.schedu
 
 const retainedFixture = structuredClone(exitedSuccessfully);
 retainedFixture.Config.Labels = {
-    "com.complete.tech.lifecycle.disposition": "retained_test_fixture",
+    "com.complete.tech.lifecycle.disposition": "retired",
     "com.complete.tech.lifecycle.reason": "retained fixture; no live service",
 };
 assert.equal(healthAssessment(retainedFixture, now, null, fixtures.stopped.scheduler).status, healthStates.retired);
+
+const sourceRecordId = "a".repeat(64);
+const sourceStopped = structuredClone(exitedSuccessfully);
+sourceStopped.Id = sourceRecordId;
+sourceStopped.LifecycleDisposition = {
+    class: "stopped",
+    id: sourceRecordId,
+    uid: 0,
+    host: "train.home.complete.tech",
+    context: "rootful",
+    reason: "owner evidence is insufficient to call this retired",
+    provenance: { kind: "source", source: "ops/fleet-recovery-20260907.md" },
+};
+sourceStopped.uid = 0;
+sourceStopped.host = "train.home.complete.tech";
+sourceStopped.context = "rootful";
+assert.equal(lifecycleDisposition(sourceStopped)?.class, "stopped");
+assert.equal(healthAssessment(sourceStopped, now, null, fixtures.stopped.scheduler).status, healthStates.stopped);
+assert.equal(healthAssessment(sourceStopped, now, null, fixtures.stopped.scheduler).disposition.reason,
+             "owner evidence is insufficient to call this retired");
+
+const sourceRecordMissingContext = structuredClone(sourceStopped);
+delete sourceRecordMissingContext.context;
+delete sourceRecordMissingContext.LifecycleDisposition.context;
+assert.equal(lifecycleDisposition(sourceRecordMissingContext), null);
 
 const unsafeReason = structuredClone(completedFromMetadata);
 unsafeReason.LifecycleDisposition.reason = "see https://example.invalid/secret";

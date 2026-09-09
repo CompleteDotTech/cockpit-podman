@@ -24,6 +24,7 @@ import Containers from './Containers.jsx';
 import Images from './Images.jsx';
 import * as client from './client.js';
 import detect_quadlets from './detect-quadlets.py';
+import lifecycle_collector from './lifecycle-dispositions.py';
 import scheduler_collector from './health-scheduler.py';
 import rest from './rest.js';
 import { KeyedRequestGate, mapWithConcurrency, OwnerRefreshGate, RequestConcurrencyGate, SchedulerRequestGate, withTimeout } from './scheduler-request.js';
@@ -45,6 +46,13 @@ const HEALTH_EVENT_INSPECT_TIMEOUT_MS = 5000;
 const HEALTH_INSPECT_CONCURRENCY = 8;
 const HEALTH_SCHEDULER_TIMEOUT_MS = 8000;
 const CONTAINER_INSPECT_INVALID = "Container inspect response is invalid";
+const LIFECYCLE_SCHEMA = "cockpit-podman-lifecycle/v1";
+const LIFECYCLE_COLLECTOR_FAILURE = "lifecycle-disposition-unavailable";
+const LIFECYCLE_COLLECTOR_TIMEOUT_MS = 5000;
+const LIFECYCLE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const LIFECYCLE_FUTURE_SKEW_MS = 5 * 60 * 1000;
+const LIFECYCLE_DISPOSITIONS = new Set(["completed_one_shot", "retired", "infrastructure_only", "stopped"]);
+const LIFECYCLE_CONTEXTS = new Set(["rootful", "rootless"]);
 // Stats are streamed independently for every owner. Coalesce a burst into a
 // single render while keeping the displayed values boundedly fresh.
 const CONTAINER_STATS_FLUSH_INTERVAL_MS = 100;
@@ -52,6 +60,61 @@ const CONTAINER_STATS_FLUSH_INTERVAL_MS = 100;
 const isContainerInventoryRow = container => container !== null &&
     typeof container === "object" && !Array.isArray(container) &&
     typeof container.Id === "string" && container.Id.trim().length > 0;
+
+const lifecycleContext = uid => uid === 0 ? "rootful" : "rootless";
+
+const lifecycleRecordText = value => typeof value === "string" && value.length > 0 && value.length <= 240 &&
+    value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value) && !/https?:\/\//i.test(value);
+
+const lifecycleMetadataFromRecord = record => ({
+    class: record.disposition,
+    id: record.id,
+    uid: record.uid,
+    host: record.host,
+    context: record.context,
+    reason: record.reason,
+    evidence: record.provenance.source,
+    provenance: record.provenance,
+});
+
+const lifecycleRecordsFromOutput = (output, containers, contextUid) => {
+    if (!output || typeof output !== "object" || Array.isArray(output) ||
+        output.schema !== LIFECYCLE_SCHEMA || typeof output.host !== "string" ||
+        !lifecycleRecordText(output.host) || !Number.isInteger(output.record_count) ||
+        output.record_count < 0 || !Array.isArray(output.records) ||
+        output.record_count !== output.records.length)
+        return null;
+    const transportHost = cockpit.transport?.host;
+    if (typeof transportHost === "string" && transportHost.length > 0 && output.host !== transportHost)
+        return null;
+
+    const observed = Date.parse(output.observed_at);
+    if (!Number.isFinite(observed) || Date.now() - observed > LIFECYCLE_MAX_AGE_MS ||
+        observed - Date.now() > LIFECYCLE_FUTURE_SKEW_MS)
+        return null;
+
+    const context = lifecycleContext(contextUid);
+    if (!LIFECYCLE_CONTEXTS.has(context))
+        return null;
+    const currentIds = new Set(containers.map(container => container.Id));
+    const records = new Map();
+    for (const record of output.records) {
+        if (!record || typeof record !== "object" || Array.isArray(record) ||
+            record.host !== output.host || record.context !== context || record.uid !== contextUid ||
+            typeof record.id !== "string" || !FULL_CONTAINER_ID.test(record.id) ||
+            !currentIds.has(record.id) || !LIFECYCLE_DISPOSITIONS.has(record.disposition) ||
+            !lifecycleRecordText(record.reason))
+            return null;
+        const provenance = record.provenance;
+        if (!provenance || typeof provenance !== "object" || Array.isArray(provenance) ||
+            provenance.kind !== "source" || !lifecycleRecordText(provenance.source))
+            return null;
+        if (records.has(record.id))
+            return null;
+        records.set(record.id, record);
+    }
+    return { host: output.host, observedAt: observed, records };
+};
 
 const containerFromInventory = (inventory, uid, key, current = null) => {
     const inventoryState = typeof inventory?.State === "string"
@@ -84,6 +147,15 @@ const containerFromInventory = (inventory, uid, key, current = null) => {
         ...(current?.NetworkSettings || {}),
         Ports: current?.NetworkSettings?.Ports || inventory.NetworkSettings?.Ports || {},
     };
+    const lifecycleDisposition = Object.prototype.hasOwnProperty.call(inventory, "LifecycleDisposition")
+        ? inventory.LifecycleDisposition
+        : current?.LifecycleDisposition;
+    const host = Object.prototype.hasOwnProperty.call(inventory, "lifecycleHost")
+        ? inventory.lifecycleHost
+        : current?.host;
+    const context = Object.prototype.hasOwnProperty.call(inventory, "lifecycleContext")
+        ? inventory.lifecycleContext
+        : current?.context || (uid === 0 ? "rootful" : "rootless");
     return {
         ...inventory,
         ...(current || {}),
@@ -96,6 +168,9 @@ const containerFromInventory = (inventory, uid, key, current = null) => {
         State: state,
         uid,
         key,
+        host,
+        context,
+        LifecycleDisposition: lifecycleDisposition,
         // An inventory-only row has enough data for lifecycle rendering but
         // must remain pending until its first full inspect establishes health
         // configuration and the native result.
@@ -131,6 +206,10 @@ class Application extends React.Component {
             // A context-level failure covers every cached row belonging to the
             // affected Podman socket until a successful refresh clears it.
             contextErrors: {},
+            // Owner-authored lifecycle records are keyed by the same
+            // owner/full-ID key as scheduler coverage. They are display-only
+            // metadata and never stand in for a health result.
+            lifecycleDispositions: {},
             // Effective systemd/native scheduler metadata is keyed by the
             // display's owner-scoped full container ID.
             schedulerCoverage: {},
@@ -426,6 +505,7 @@ class Application extends React.Component {
         const validInventory = containerList.filter(isContainerInventoryRow);
         const invalidInventoryRow = validInventory.length !== containerList.length;
         let schedulerPromise = null;
+        let lifecyclePromise = null;
         if (!invalidInventoryRow) {
             const schedulerRequest = this.schedulerRequests.begin(con.uid);
             // Scheduler metadata uses the inventory identity and can run
@@ -434,6 +514,8 @@ class Application extends React.Component {
             // refresh generations, so a topology event discards stale output.
             schedulerPromise = this.updateSchedulerCoverage(con, validInventory, schedulerRequest, request,
                                                              HEALTH_SCHEDULER_TIMEOUT_MS);
+            lifecyclePromise = this.updateLifecycleDispositions(con, validInventory, request,
+                                                                LIFECYCLE_COLLECTOR_TIMEOUT_MS);
         }
 
         // The inventory response is sufficient for lifecycle and identity
@@ -469,6 +551,19 @@ class Application extends React.Component {
                 resultByKey.set(makeKey(con.uid, result.container.Id), result);
         }
 
+        const lifecycleResult = lifecyclePromise ? await lifecyclePromise : null;
+        const lifecycleById = lifecycleResult?.records || new Map();
+        const lifecycleHost = lifecycleResult?.host || null;
+        const context = lifecycleContext(this.schedulerUid(con));
+        const inventoryWithLifecycle = new Map(validInventory.map(inventory => {
+            const record = lifecycleById.get(inventory.Id);
+            return [inventory.Id, {
+                ...inventory,
+                LifecycleDisposition: record ? lifecycleMetadataFromRecord(record) : null,
+                lifecycleHost,
+                lifecycleContext: context,
+            }];
+        }));
         const snapshot = [];
         const errors = {};
         for (const inventory of containerList) {
@@ -477,26 +572,37 @@ class Application extends React.Component {
             }
             const id = inventory.Id;
             const key = makeKey(con.uid, id);
+            const enrichedInventory = inventoryWithLifecycle.get(id) || inventory;
             const result = resultByKey.get(key);
             if (result?.error) {
                 const old = this.state.containers?.[key] || null;
-                const failed = containerFromInventory(inventory, con.uid, key, old);
+                const failed = containerFromInventory(enrichedInventory, con.uid, key, old);
                 failed.healthDetailsLoaded = false;
                 snapshot.push(failed);
                 errors[key] = errorText(result.error);
             } else if (result && !isValidHealthDetails(inventory, result.detail)) {
                 const old = this.state.containers?.[key] || null;
-                const failed = containerFromInventory(inventory, con.uid, key, old);
+                const failed = containerFromInventory(enrichedInventory, con.uid, key, old);
                 failed.healthDetailsLoaded = false;
                 snapshot.push(failed);
                 errors[key] = CONTAINER_INSPECT_INVALID;
             } else if (result?.detail) {
-                const detail = { ...result.detail, uid: con.uid, key };
+                const record = lifecycleById.get(id);
+                const detail = {
+                    ...result.detail,
+                    uid: con.uid,
+                    key,
+                    host: lifecycleHost || result.detail.host,
+                    context,
+                    LifecycleDisposition: record
+                        ? lifecycleMetadataFromRecord(record)
+                        : result.detail.LifecycleDisposition,
+                };
                 detail.healthDetailsLoaded = true;
                 snapshot.push(detail);
             } else {
                 const old = this.state.containers?.[key] || null;
-                snapshot.push(containerFromInventory(inventory, con.uid, key, old));
+                snapshot.push(containerFromInventory(enrichedInventory, con.uid, key, old));
             }
         }
 
@@ -561,6 +667,7 @@ class Application extends React.Component {
         if (!this.isCurrentConnection(con) || !this.healthRefreshGate.isCurrent(con.uid, request))
             return;
         if (invalidInventoryRow) {
+            this.applyLifecycleDispositions(con, null, request);
             const schedulerRequest = this.schedulerRequests.begin(con.uid);
             this.applySchedulerCoverage(con, this.schedulerUid(con), snapshot, null,
                                         SCHEDULER_FAILURE, schedulerRequest);
@@ -586,6 +693,95 @@ class Application extends React.Component {
             coverage_reason: "collector-error",
             collector_errors: [reason],
         };
+    }
+
+    applyLifecycleDispositions(con, result, refreshRequest = null) {
+        if (!this.isCurrentConnection(con) ||
+            (refreshRequest && !this.healthRefreshGate.isCurrent(con.uid, refreshRequest)))
+            return false;
+        const dispositions = {};
+        if (result?.records instanceof Map) {
+            result.records.forEach((record, id) => {
+                dispositions[makeKey(con.uid, id)] = lifecycleMetadataFromRecord(record);
+            });
+        }
+        const ownerPrefix = `${con.uid ?? "user"}-`;
+        this.setState(prevState => {
+            if (refreshRequest && !this.healthRefreshGate.isCurrent(con.uid, refreshRequest))
+                return null;
+            const lifecycleDispositions = {};
+            Object.entries(prevState.lifecycleDispositions || {}).forEach(([key, value]) => {
+                if (!key.startsWith(ownerPrefix))
+                    lifecycleDispositions[key] = value;
+            });
+            Object.assign(lifecycleDispositions, dispositions);
+            return { lifecycleDispositions };
+        });
+        return true;
+    }
+
+    async updateLifecycleDispositions(con, containers, refreshRequest = null,
+                                      timeoutMs = LIFECYCLE_COLLECTOR_TIMEOUT_MS) {
+        if (!this.isCurrentConnection(con) ||
+            (refreshRequest && !this.healthRefreshGate.isCurrent(con.uid, refreshRequest)))
+            return null;
+        const contextUid = this.schedulerUid(con);
+        if (!Number.isInteger(contextUid) || contextUid < 0) {
+            this.applyLifecycleDispositions(con, null, refreshRequest);
+            return null;
+        }
+
+        const identity = {
+            uid: contextUid,
+            ids: containers.map(container => container.Id).filter(id => FULL_CONTAINER_ID.test(id)),
+        };
+        const owner = this.state.users.find(user => user.uid === con.uid);
+        const options = {
+            err: "message",
+            environ: ["LC_ALL=C"],
+        };
+        let process;
+        try {
+            if (con.uid === null || con.uid === 0) {
+                if (con.uid === 0)
+                    options.superuser = "require";
+                process = python.spawn(lifecycle_collector,
+                                       ["--uid", String(contextUid)], options);
+            } else {
+                if (!owner?.name)
+                    throw new Error("Service user name is unavailable");
+                process = cockpit.spawn([
+                    "runuser", "--preserve-environment", "-u", owner.name, "--",
+                    "/usr/bin/python3", "-c", lifecycle_collector,
+                    "--uid", String(contextUid),
+                ], {
+                    ...options,
+                    superuser: "require",
+                    environ: ["LC_ALL=C", `XDG_RUNTIME_DIR=/run/user/${contextUid}`],
+                });
+            }
+            process.input(JSON.stringify(identity));
+            process.input(null);
+            const output = JSON.parse(await withTimeout(process, timeoutMs,
+                                                        "Lifecycle disposition collection timed out",
+                                                        () => process?.close?.()));
+            if (refreshRequest && !this.healthRefreshGate.isCurrent(con.uid, refreshRequest))
+                return null;
+            const result = lifecycleRecordsFromOutput(output, containers, contextUid);
+            if (!result)
+                throw new Error("Lifecycle disposition collector returned an invalid schema");
+            this.applyLifecycleDispositions(con, result, refreshRequest);
+            return result;
+        } catch {
+            if (refreshRequest && !this.healthRefreshGate.isCurrent(con.uid, refreshRequest))
+                return null;
+            console.warn("lifecycle disposition collection failed", {
+                uid: con.uid,
+                stage: LIFECYCLE_COLLECTOR_FAILURE,
+            });
+            this.applyLifecycleDispositions(con, null, refreshRequest);
+            return null;
+        }
     }
 
     applySchedulerCoverage(con, contextUid, containers, coverage, failure = null, request = null) {
@@ -1055,6 +1251,12 @@ class Application extends React.Component {
                     }
                     details.uid = con.uid;
                     details.key = key;
+                    const lifecycleDisposition = this.state.lifecycleDispositions?.[key];
+                    if (lifecycleDisposition) {
+                        details.LifecycleDisposition = lifecycleDisposition;
+                        details.host = lifecycleDisposition.host;
+                        details.context = lifecycleDisposition.context;
+                    }
                     details.healthDetailsLoaded = true;
                     // HACK: during restart State never changes from "running"
                     //       override it to reconnect console after restart
@@ -1203,6 +1405,8 @@ class Application extends React.Component {
                 delete containers[makeKey(con.uid, id)];
                 const containerErrors = { ...prevState.containerErrors };
                 delete containerErrors[makeKey(con.uid, id)];
+                const lifecycleDispositions = { ...prevState.lifecycleDispositions };
+                delete lifecycleDispositions[makeKey(con.uid, id)];
                 const schedulerCoverage = { ...prevState.schedulerCoverage };
                 delete schedulerCoverage[makeKey(con.uid, id)];
                 let pods;
@@ -1218,7 +1422,7 @@ class Application extends React.Component {
                     pods = prevState.pods;
                     this.updatePods(con);
                 }
-                return { containers, containerErrors, schedulerCoverage, pods };
+                return { containers, containerErrors, lifecycleDispositions, schedulerCoverage, pods };
             }, () => {
                 // Read the post-removal state from the setState callback.  The
                 // old immediate read could feed the deleted container back to
@@ -1303,6 +1507,11 @@ class Application extends React.Component {
             });
             const contextErrors = { ...prevState.contextErrors };
             delete contextErrors[con.uid];
+            const lifecycleDispositions = {};
+            Object.entries(prevState.lifecycleDispositions || {}).forEach(([id, value]) => {
+                if (!id.startsWith(`${con.uid ?? "user"}-`))
+                    lifecycleDispositions[id] = value;
+            });
             const schedulerCoverage = {};
             Object.entries(prevState.schedulerCoverage || {}).forEach(([id, value]) => {
                 if (!id.startsWith(`${con.uid ?? "user"}-`))
@@ -1310,7 +1519,7 @@ class Application extends React.Component {
             });
             const schedulerErrors = { ...prevState.schedulerErrors };
             delete schedulerErrors[con.uid];
-            return { ...next, containerErrors, contextErrors, schedulerCoverage, schedulerErrors };
+            return { ...next, containerErrors, contextErrors, lifecycleDispositions, schedulerCoverage, schedulerErrors };
         });
 
         // keep dummy (null) connections from other users, only remove valid ones

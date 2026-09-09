@@ -66,7 +66,7 @@ const ContainerHealthLogs = ({ con, container, onAddNotification, state, assessm
                     ? _("Health data collection timed out")
                 : _("Health data collection failed");
         case "stopped":
-            return _("Container is stopped; health result is not live");
+            return assessment.disposition?.reason || _("Container is stopped; health result is not live");
         case "completed":
             return assessment.disposition?.reason || _("Container completed; health result is not live");
         case "retired":

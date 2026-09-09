@@ -365,7 +365,7 @@ const health_reason = (assessment) => {
                 ? _("Health data collection timed out")
             : _("Health data collection failed");
     case healthStates.stopped:
-        return _("Container is stopped; health result is not live");
+        return assessment.disposition?.reason || _("Container is stopped; health result is not live");
     case healthStates.completed:
         return assessment.disposition?.reason || _("Container completed; health result is not live");
     case healthStates.retired:
