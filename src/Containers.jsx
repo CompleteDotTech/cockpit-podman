@@ -41,6 +41,7 @@ import { PodCreateModal } from './PodCreateModal.jsx';
 import PruneUnusedContainersModal from './PruneUnusedContainersModal.jsx';
 import * as client from './client.js';
 import { healthAssessment, healthStates } from './health.js';
+import { createLocalImagesSelector } from './overview-model.js';
 import * as utils from './util.js';
 
 import './Containers.scss';
@@ -413,6 +414,72 @@ const ContainerTerminalWrapper = ({ webglAvailable, child, service_button = fals
     );
 };
 
+// Detail tabs do not display streamed CPU/memory statistics. Preserve their
+// mounted state while skipping unrelated row/stat updates, including the
+// layout measurements performed by Tabs even for collapsed rows.
+const ContainerDetailsPanel = React.memo(({
+    container, con, localImages, width, webglAvailable, onAddNotification, now, collectionError, scheduler,
+}) => {
+    const tabs = [];
+    if (container.State && con !== null) {
+        tabs.push({
+            name: _("Details"),
+            renderer: ContainerDetails,
+            data: { container }
+        });
+
+        if (!container.isDownloading) {
+            tabs.push({
+                name: _("Integration"),
+                renderer: ContainerIntegration,
+                data: { container, localImages }
+            });
+            tabs.push({
+                name: _("Logs"),
+                renderer: ContainerTerminalWrapper,
+                data: {
+                    containerId: container.Id,
+                    containerStatus: container.State.Status,
+                    width,
+                    uid: container.uid,
+                    systemd_unit: container.Config?.Labels?.PODMAN_SYSTEMD_UNIT,
+                    webglAvailable,
+                    child: ContainerLogs,
+                    service_button: true,
+                }
+            });
+            tabs.push({
+                name: _("Console"),
+                renderer: ContainerTerminalWrapper,
+                data: {
+                    con,
+                    containerId: container.Id,
+                    containerStatus: container.State.Status,
+                    width,
+                    uid: container.uid,
+                    tty: !!container.Config?.Tty,
+                    webglAvailable,
+                    child: ContainerTerminal,
+                }
+            });
+        }
+
+        const assessment = healthAssessment(container, now, collectionError, scheduler);
+        tabs.push({
+            name: _("Health check"),
+            renderer: ContainerHealthLogs,
+            data: {
+                con,
+                container,
+                onAddNotification,
+                state: localize_health_assessment(assessment),
+                assessment,
+            }
+        });
+    }
+    return <ListingPanel colSpan='4' tabRenderers={tabs} />;
+});
+
 class Containers extends React.Component {
     static contextType = DialogsContext;
 
@@ -426,6 +493,7 @@ class Containers extends React.Component {
             showPruneUnusedContainersModal: false,
         };
         this.healthTimer = null;
+        this.selectLocalImages = createLocalImagesSelector(utils.image_name);
         this.renderRow = this.renderRow.bind(this);
         this.onWindowResize = this.onWindowResize.bind(this);
         this.podStats = this.podStats.bind(this);
@@ -573,69 +641,13 @@ class Containers extends React.Component {
             props: { className: "pf-v6-c-table__action" }
         });
 
-        const tty = !!container.Config?.Tty;
-
-        const tabs = [];
-        if (container.State && user.con !== null) {
-            tabs.push({
-                name: _("Details"),
-                renderer: ContainerDetails,
-                data: { container }
-            });
-
-            if (!container.isDownloading) {
-                tabs.push({
-                    name: _("Integration"),
-                    renderer: ContainerIntegration,
-                    data: { container, localImages }
-                });
-                tabs.push({
-                    name: _("Logs"),
-                    renderer: ContainerTerminalWrapper,
-                    data: {
-                        containerId: container.Id,
-                        containerStatus: container.State.Status,
-                        width: this.state.width,
-                        uid: container.uid,
-                        systemd_unit: container.Config?.Labels?.PODMAN_SYSTEMD_UNIT,
-                        webglAvailable: this.webglAvailable,
-                        child: ContainerLogs,
-                        service_button: true,
-                    }
-                });
-                tabs.push({
-                    name: _("Console"),
-                    renderer: ContainerTerminalWrapper,
-                    data: {
-                        con: user.con,
-                        containerId: container.Id,
-                        containerStatus: container.State.Status,
-                        width: this.state.width,
-                        uid: container.uid,
-                        tty,
-                        webglAvailable: this.webglAvailable,
-                        child: ContainerTerminal,
-                    }
-                });
-            }
-        }
-
-        if (container.State && user.con !== null) {
-            tabs.push({
-                name: _("Health check"),
-                renderer: ContainerHealthLogs,
-                data: {
-                    con: user.con,
-                    container,
-                    onAddNotification: this.props.onAddNotification,
-                    state: localizedHealth,
-                    assessment,
-                }
-            });
-        }
-
         return {
-            expandedContent: <ListingPanel colSpan='4' tabRenderers={tabs} />,
+            expandedContent: <ContainerDetailsPanel container={container} con={user.con}
+                                                   localImages={localImages} width={this.state.width}
+                                                   webglAvailable={this.webglAvailable}
+                                                   onAddNotification={this.props.onAddNotification}
+                                                   now={this.state.now} collectionError={collectionError}
+                                                   scheduler={scheduler} />,
             columns,
             initiallyExpanded: document.location.hash.substring(1) === container.Id,
             props: {
@@ -954,16 +966,9 @@ class Containers extends React.Component {
         }
 
         // Convert to the search result output
-        let localImages = null;
+        const localImages = this.selectLocalImages(this.props.images);
         let nonIntermediateImages = null;
-        if (this.props.images) {
-            localImages = Object.keys(this.props.images).map(id => {
-                const img = this.props.images[id];
-                img.Index = img.RepoTags?.[0] ? img.RepoTags[0].split('/')[0] : "";
-                img.Name = utils.image_name(img);
-                img.toString = function imgToString() { return this.Name };
-                return img;
-            }, []);
+        if (localImages) {
             nonIntermediateImages = localImages.filter(img => img.Index !== "");
         }
 
