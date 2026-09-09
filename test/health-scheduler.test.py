@@ -118,6 +118,42 @@ def main() -> None:
     _, errors = MODULE._timer_schedule({"AccuracySec": "1s"}, executing=True)
     assert "missing-recurring-interval" in errors and "missing-next-trigger" in errors
 
+    # A one-shot can complete between the timer and service snapshots. Only a
+    # fresh waiting timer with its next trigger resolves that inconsistent pair.
+    for refreshed_state, expected in [
+        ("waiting", "covered"),
+        ("elapsed", "uncovered"),
+        ("running", "uncovered"),
+        ("missing", "uncovered"),
+        ("timeout", "uncovered"),
+    ]:
+        timer_reads = 0
+        def raced_systemctl(argv, timeout):
+            nonlocal timer_reads
+            result = fake_systemctl(argv, timeout)
+            if "list-units" in argv:
+                return result
+            if "podman-healthcheck@fixture.timer" in argv:
+                timer_reads += 1
+                if timer_reads == 1:
+                    result.stdout = result.stdout.replace("SubState=elapsed", "SubState=running")
+                elif refreshed_state == "timeout":
+                    return MODULE.CommandResult(list(argv), 124, "", "", timed_out=True)
+                elif refreshed_state == "missing":
+                    result.stdout = ""
+                else:
+                    result.stdout = result.stdout.replace("SubState=elapsed", "SubState=" + refreshed_state)
+            else:
+                result.stdout = result.stdout.replace("ActiveState=active\nSubState=running", "ActiveState=inactive\nSubState=dead")
+            return result
+        MODULE.run_bounded = raced_systemctl
+        try:
+            result = MODULE.collect_coverage([ref], uid=0, manager="system", systemctl_bin="fixture-systemctl")
+        finally:
+            MODULE.run_bounded = original_run_bounded
+        assert timer_reads == 2  # One reconciliation only, no retry loop.
+        assert result["containers"][ref.key]["coverage_status"] == expected
+
     print("health-scheduler safety tests: PASS")
 
 

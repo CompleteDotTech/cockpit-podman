@@ -761,6 +761,30 @@ def collect_coverage(
                 coverage.errors.append("systemd-health-service-metadata-unavailable")
             return _result(refs, contexts, uid, manager, global_errors, unattributed, listed_units=len(timer_units), unit_query_count=3)
 
+    unit_query_count = 2 + bool(service_units)
+    # Timer and service metadata are read separately. A short one-shot may
+    # finish between those reads, leaving an old running timer beside a now
+    # inactive service. Re-read those timers once under the same overall
+    # deadline; only fresh waiting/executing evidence can establish coverage.
+    reconcile_units = [
+        unit for unit in timer_units
+        if timer_sections.get(unit, {}).get("SubState") == "running"
+        and (service_sections.get(_service_unit(timer_sections.get(unit, {}), unit) or "", {}).get("ActiveState"),
+             service_sections.get(_service_unit(timer_sections.get(unit, {}), unit) or "", {}).get("SubState"))
+        not in {("activating", "start"), ("active", "running")}
+    ]
+    if reconcile_units:
+        refreshed = invoke([*prefix, "show", "--no-pager", timer_property_arg, *reconcile_units])
+        unit_query_count += 1
+        refreshed_sections = parse_show_sections(refreshed.stdout) if refreshed.returncode == 0 else {}
+        for unit in reconcile_units:
+            # Missing/failed refreshed metadata must not retain an old timer.
+            timer_sections.pop(unit, None)
+            if unit in refreshed_sections:
+                timer_sections[unit] = refreshed_sections[unit]
+        if refreshed.returncode != 0:
+            global_errors.append(_command_error("systemd timer reconciliation failed", refreshed))
+
     names = _name_index(refs)
     for timer_unit in timer_units:
         timer = timer_sections.get(timer_unit)
@@ -813,7 +837,7 @@ def collect_coverage(
         contexts[ref.key].schedules.append(schedule)
         contexts[ref.key].errors.extend(schedule_errors)
 
-    return _result(refs, contexts, uid, manager, global_errors, unattributed, listed_units=len(timer_units), unit_query_count=2 + bool(service_units))
+    return _result(refs, contexts, uid, manager, global_errors, unattributed, listed_units=len(timer_units), unit_query_count=unit_query_count)
 
 
 def _result(
