@@ -154,7 +154,10 @@ def machine_id_digest() -> str:
         raise RecordError("authoritative machine identity is not ASCII") from exc
     if not MACHINE_ID.fullmatch(value):
         raise RecordError("authoritative machine identity has invalid format")
-    return hashlib.sha256(bytes(content)).hexdigest()
+    # The captured binding is over the validated 32-hex machine ID.  The
+    # optional file newline is formatting and is deliberately excluded.
+    machine_id = value[:-1] if value.endswith("\n") else value
+    return hashlib.sha256(machine_id.encode("ascii")).hexdigest()
 
 
 def load_json(path: Path) -> Any:

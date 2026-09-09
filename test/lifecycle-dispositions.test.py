@@ -2,8 +2,10 @@
 """Regression tests for the protected 24-row lifecycle bootstrap."""
 
 import importlib.util
+import hashlib
 import io
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -24,6 +26,32 @@ BUILD_SPEC.loader.exec_module(BUILD)
 HOST = "completetrain-b550-gaming-x-v2"
 MACHINE_ID_SHA256 = "7c577a84da00e3b2683cbb782268e70733a3edd59b26794a5ccbd0367e5a2829"
 PACKET_PATH = ROOT / "packaging" / "lifecycle-bootstrap" / "lifecycle-bootstrap.json"
+
+# The production reader must hash the validated machine-id value, not its
+# optional file newline, while still rejecting symlinked or unprotected files.
+if os.geteuid() == 0:
+    original_machine_id_path = MODULE.MACHINE_ID_PATH
+    with tempfile.TemporaryDirectory() as temporary:
+        machine_path = Path(temporary) / "machine-id"
+        machine_value = "a" * 32
+        machine_path.write_text(machine_value + "\n", encoding="ascii")
+        machine_path.chmod(0o444)
+        assert machine_path.stat().st_uid == 0
+        MODULE.MACHINE_ID_PATH = machine_path
+        try:
+            assert MODULE.machine_id_digest() == hashlib.sha256(machine_value.encode("ascii")).hexdigest()
+            symlink_path = Path(temporary) / "machine-id-link"
+            symlink_path.symlink_to(machine_path)
+            MODULE.MACHINE_ID_PATH = symlink_path
+            try:
+                MODULE.machine_id_digest()
+            except MODULE.RecordError:
+                pass
+            else:
+                raise AssertionError("symlinked machine identity must fail closed")
+        finally:
+            MODULE.MACHINE_ID_PATH = original_machine_id_path
+
 original_machine_id_digest = MODULE.machine_id_digest
 MODULE.machine_id_digest = lambda: MACHINE_ID_SHA256
 try:
