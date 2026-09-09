@@ -15,6 +15,25 @@ const fixture = JSON.parse(await readFile(resolve(here, "scheduler-refresh-fixtu
 // same-UID reconnect. The production guard must run before that stale frame
 // can replace the new connection's pending batch or cancel its timer.
 const applicationSource = await readFile(resolve(here, "../src/app.jsx"), "utf8");
+// cockpit.spawn().input(message) closes the stream by default. Collector
+// calls must leave the first write open and send exactly one EOF with the
+// following null input; two done controls make the bridge call write_eof()
+// twice on the same transport.
+assert.equal((applicationSource.match(/process\.input\(JSON\.stringify\(identity\), true\);/g) || []).length, 2);
+assert.equal((applicationSource.match(/process\.input\(JSON\.stringify\(identity\)\);/g) || []).length, 0);
+const collectorInputCalls = [];
+const collectorProcess = {
+    input(message, stream) {
+        collectorInputCalls.push({ message, stream });
+    },
+};
+const collectorIdentity = { uid: 1000, containers: [] };
+collectorProcess.input(JSON.stringify(collectorIdentity), true);
+collectorProcess.input(null);
+assert.deepEqual(collectorInputCalls, [
+    { message: JSON.stringify(collectorIdentity), stream: true },
+    { message: null, stream: undefined },
+]);
 const lifecycleValidationStart = applicationSource.indexOf("const lifecycleRecordText =");
 const lifecycleValidationEnd = applicationSource.indexOf("\nconst containerFromInventory", lifecycleValidationStart);
 assert.ok(lifecycleValidationStart >= 0 && lifecycleValidationEnd > lifecycleValidationStart);
