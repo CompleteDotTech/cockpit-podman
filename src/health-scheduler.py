@@ -492,7 +492,7 @@ def _service_unit(properties: Mapping[str, str], timer_unit: str) -> str | None:
     return None
 
 
-def _timer_schedule(properties: Mapping[str, str]) -> tuple[dict[str, Any], list[str]]:
+def _timer_schedule(properties: Mapping[str, str], *, executing: bool = False) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     interval_candidates: list[tuple[float, str]] = []
     for names in (("OnUnitActiveUSec", "OnUnitActiveSec"), ("OnUnitInactiveUSec", "OnUnitInactiveSec")):
@@ -531,7 +531,7 @@ def _timer_schedule(properties: Mapping[str, str]) -> tuple[dict[str, Any], list
     next_monotonic = properties.get("NextElapseUSecMonotonic", "").strip()
     valid_next_realtime = next_realtime if next_realtime.lower() not in {"", "-", "n/a", "na", "infinity", "inf", "0"} else None
     valid_next_monotonic = next_monotonic if next_monotonic.lower() not in {"", "-", "n/a", "na", "infinity", "inf", "0"} else None
-    if valid_next_realtime is None and valid_next_monotonic is None:
+    if valid_next_realtime is None and valid_next_monotonic is None and not (executing and interval is not None):
         # An active unit with no next elapse can be a one-shot or already
         # elapsed timer. Its configured interval is insufficient evidence of
         # future health checks, so freshness must remain unavailable.
@@ -770,11 +770,14 @@ def collect_coverage(
         service_unit = _service_unit(timer, timer_unit)
         service = service_sections.get(service_unit or "")
         potential_health = _looks_like_health_unit(timer_unit, service_unit)
-        if timer.get("ActiveState") != "active" or timer.get("SubState") != "waiting":
-            # The list query asked for active units; retaining this guard keeps
-            # a concurrent stop from becoming active coverage. A timer that is
-            # active but not waiting is elapsed, running, or transitional and
-            # cannot prove that another health check is scheduled.
+        executing = timer.get("SubState") == "running" and (
+            ((service or {}).get("ActiveState"), (service or {}).get("SubState"))
+            in {("activating", "start"), ("active", "running")}
+        )
+        if timer.get("ActiveState") != "active" or (timer.get("SubState") != "waiting" and not executing):
+            # A recurring timer temporarily has no next elapse while its
+            # associated service executes. Elapsed/stopped timers still do
+            # not prove recurring coverage.
             if potential_health:
                 unattributed.append({
                     "unit": timer_unit,
@@ -797,7 +800,7 @@ def collect_coverage(
             unattributed.append({"unit": timer_unit, "service_unit": service_unit, "reason": match_method or "no-container-match"})
             continue
 
-        schedule, schedule_errors = _timer_schedule(timer)
+        schedule, schedule_errors = _timer_schedule(timer, executing=executing)
         schedule.update({
             "unit": timer_unit,
             "service_unit": service_unit,

@@ -302,7 +302,8 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
 
     const lifecycle = String(container?.State?.Status || "").toLowerCase();
     if (lifecycle && lifecycle !== "running") {
-        const completed = lifecycle === "exited" && Number(container?.State?.ExitCode) === 0 &&
+        const exitCode = container?.State?.ExitCode;
+        const completed = lifecycle === "exited" && (exitCode === 0 || exitCode === "0") &&
             isCompletedContainer(container);
         return base({
             status: completed ? healthStates.completed : healthStates.stopped,

@@ -94,6 +94,30 @@ def main() -> None:
     assert record["active_coverage_count"] == 0
     assert any(item["reason"] == "timer-not-waiting" for item in coverage["unattributed_health_timers"])
 
+    # Real one-shot health execution: timer running, service activating/start,
+    # recurring cadence retained, and no next elapse until completion.
+    for service_state, expected in [
+        ("ActiveState=activating\nSubState=start", "covered"),
+        ("ActiveState=active\nSubState=running", "covered"),
+        ("ActiveState=inactive\nSubState=dead", "uncovered"),
+    ]:
+        def executing_systemctl(argv, timeout):
+            result = fake_systemctl(argv, timeout)
+            if "podman-healthcheck@fixture.timer" in argv:
+                result.stdout = result.stdout.replace("SubState=elapsed", "SubState=running").replace(
+                    "NextElapseUSecRealtime=Mon 2026-09-08 12:01:30 EDT\n", "")
+            elif "list-units" not in argv:
+                result.stdout = result.stdout.replace("ActiveState=active\nSubState=running", service_state)
+            return result
+        MODULE.run_bounded = executing_systemctl
+        try:
+            result = MODULE.collect_coverage([ref], uid=0, manager="system", systemctl_bin="fixture-systemctl")
+        finally:
+            MODULE.run_bounded = original_run_bounded
+        assert result["containers"][ref.key]["coverage_status"] == expected
+    _, errors = MODULE._timer_schedule({"AccuracySec": "1s"}, executing=True)
+    assert "missing-recurring-interval" in errors and "missing-next-trigger" in errors
+
     print("health-scheduler safety tests: PASS")
 
 

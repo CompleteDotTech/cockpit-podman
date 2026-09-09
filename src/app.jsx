@@ -60,6 +60,9 @@ const containerFromInventory = (inventory, uid, key, current = null) => {
     const state = {
         ...(current?.State || {}),
         ...inventoryState,
+        // Podman's list response keeps the exit code at the top level.
+        // Preserve it when rendering a completed job without an inspect.
+        ...(Object.hasOwn(inventory, "ExitCode") ? { ExitCode: inventory.ExitCode } : {}),
     };
     const id = inventory.Id;
     const name = inventory.Names?.[0]?.replace(/^\//, "") || inventory.Name || current?.Name || id;

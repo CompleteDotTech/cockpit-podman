@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { isValidHealthDetails } from "../src/health.js";
+import { healthAssessment, isValidHealthDetails } from "../src/health.js";
 import { KeyedRequestGate, mapWithConcurrency, OwnerRefreshGate, RequestConcurrencyGate, SchedulerRequestGate, withTimeout } from "../src/scheduler-request.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -15,6 +15,16 @@ const fixture = JSON.parse(await readFile(resolve(here, "scheduler-refresh-fixtu
 // same-UID reconnect. The production guard must run before that stale frame
 // can replace the new connection's pending batch or cancel its timer.
 const applicationSource = await readFile(resolve(here, "../src/app.jsx"), "utf8");
+// Exercise the production inventory mapping with a real list-shaped one-shot.
+const inventoryMapperStart = applicationSource.indexOf("const containerFromInventory =");
+const inventoryMapperEnd = applicationSource.indexOf("\n// sort order", inventoryMapperStart);
+const mapInventory = new Function(applicationSource.slice(inventoryMapperStart, inventoryMapperEnd) + "\nreturn containerFromInventory;")();
+for (const [exitCode, expected] of [[0, "completed"], ["0", "completed"], [1, "stopped"], [null, "stopped"], [undefined, "stopped"]]) {
+    const row = mapInventory({ Id: "one-shot", Names: ["one-shot"], State: "exited", ExitCode: exitCode,
+        Labels: { "com.docker.compose.oneoff": "True" } }, 0, "0-one-shot");
+    assert.equal(healthAssessment(row).status, expected);
+}
+
 const statsQueueStart = applicationSource.indexOf("    queueContainerStats(con, stats) {");
 const statsQueueEnd = applicationSource.indexOf("\n    clearContainerStats", statsQueueStart);
 assert.ok(statsQueueStart >= 0 && statsQueueEnd > statsQueueStart);
