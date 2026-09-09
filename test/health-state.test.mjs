@@ -231,6 +231,7 @@ const sourceProvenance = {
 const completedFromMetadata = structuredClone(exitedSuccessfully);
 completedFromMetadata.Id = dispositionIdentity.id;
 completedFromMetadata.uid = 0;
+completedFromMetadata.ownerUid = 0;
 completedFromMetadata.host = "train.home.complete.tech";
 completedFromMetadata.context = "rootful";
 completedFromMetadata.LifecycleDisposition = {
@@ -243,6 +244,26 @@ assert.equal(lifecycleDisposition(completedFromMetadata)?.class, "completed_one_
 assert.equal(healthAssessment(completedFromMetadata, now, null, fixtures.stopped.scheduler).status, healthStates.completed);
 assert.equal(healthAssessment(completedFromMetadata, now, null, fixtures.stopped.scheduler).disposition.reason,
              "bootstrap job completed and is not a live workload");
+
+// A session-user connection keeps uid null for UI routing while the Podman
+// backend owner is resolved separately as numeric UID 1000. Lifecycle
+// identity must use that verified owner context rather than the route key.
+const nullRoutedRootless = structuredClone(completedFromMetadata);
+nullRoutedRootless.uid = null;
+nullRoutedRootless.ownerUid = 1000;
+nullRoutedRootless.host = "train.home.complete.tech";
+nullRoutedRootless.context = "rootless";
+nullRoutedRootless.LifecycleDisposition = {
+    ...nullRoutedRootless.LifecycleDisposition,
+    uid: 1000,
+    host: "train.home.complete.tech",
+    context: "rootless",
+};
+assert.equal(nullRoutedRootless.uid, null);
+assert.equal(nullRoutedRootless.ownerUid, 1000);
+assert.equal(lifecycleDisposition(nullRoutedRootless)?.class, "completed_one_shot");
+assert.equal(healthAssessment(nullRoutedRootless, now, null, fixtures.stopped.scheduler).status,
+             healthStates.completed);
 
 const missingProvenanceReference = structuredClone(completedFromMetadata);
 delete missingProvenanceReference.LifecycleDisposition.provenance.source_ref;
@@ -341,6 +362,7 @@ sourceStopped.LifecycleDisposition = {
     provenance: sourceProvenance,
 };
 sourceStopped.uid = 0;
+sourceStopped.ownerUid = 0;
 sourceStopped.host = "train.home.complete.tech";
 sourceStopped.context = "rootful";
 assert.equal(lifecycleDisposition(sourceStopped)?.class, "stopped");

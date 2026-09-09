@@ -74,10 +74,13 @@ const lifecycleHostText = value => typeof value === "string" && LIFECYCLE_HOSTNA
     !["localhost", "localhost.localdomain"].includes(value.trim().toLowerCase())
     ? value.trim().toLowerCase() : null;
 
-const lifecycleMetadataFromRecord = record => ({
+const lifecycleMetadataFromRecord = (record, ownerUid) => ({
     class: record.disposition,
     id: record.id,
-    uid: record.uid,
+    // Keep the connection routing UID separate from the numeric Podman owner
+    // UID.  The session-user connection routes as null while its backend
+    // context is resolved independently by schedulerUid(con).
+    uid: ownerUid,
     host: record.host,
     context: record.context,
     reason: record.reason,
@@ -143,7 +146,8 @@ const lifecycleRecordsFromOutput = (output, containers, contextUid, authoritativ
     return { host: output.host, observedAt: observed, projectedAt: projected, records };
 };
 
-const containerFromInventory = (inventory, uid, key, current = null, trustedLifecycle = undefined) => {
+const containerFromInventory = (inventory, uid, key, current = null, ownerUid = null,
+                               trustedLifecycle = undefined) => {
     const inventoryState = typeof inventory?.State === "string"
         ? { Status: inventory.State.toLowerCase() }
         : (inventory?.State || {});
@@ -198,6 +202,7 @@ const containerFromInventory = (inventory, uid, key, current = null, trustedLife
         Mounts: current?.Mounts || inventory.Mounts || [],
         State: state,
         uid,
+        ownerUid,
         key,
         host,
         context,
@@ -510,6 +515,7 @@ class Application extends React.Component {
         if (!this.isCurrentConnection(con) || !this.healthRefreshGate.isCurrent(con.uid, request))
             return;
 
+        const ownerUid = this.schedulerUid(con);
         const refreshDeadline = Date.now() + HEALTH_REFRESH_TIMEOUT_MS;
         const initialEventGenerations = new Map();
         const initialEventActions = new Map();
@@ -585,12 +591,12 @@ class Application extends React.Component {
         const lifecycleResult = lifecyclePromise ? await lifecyclePromise : null;
         const lifecycleById = lifecycleResult?.records || new Map();
         const lifecycleHost = lifecycleResult?.host || null;
-        const context = lifecycleContext(this.schedulerUid(con));
+        const context = lifecycleContext(ownerUid);
         const inventoryWithLifecycle = new Map(validInventory.map(inventory => {
             const record = lifecycleById.get(inventory.Id);
             return [inventory.Id, {
                 ...inventory,
-                LifecycleDisposition: record ? lifecycleMetadataFromRecord(record) : null,
+                LifecycleDisposition: record ? lifecycleMetadataFromRecord(record, ownerUid) : null,
                 lifecycleHost,
                 lifecycleContext: context,
             }];
@@ -606,16 +612,18 @@ class Application extends React.Component {
             const enrichedInventory = inventoryWithLifecycle.get(id) || inventory;
             const result = resultByKey.get(key);
             const record = lifecycleById.get(id);
-            const trustedLifecycle = record ? lifecycleMetadataFromRecord(record) : null;
+            const trustedLifecycle = record ? lifecycleMetadataFromRecord(record, ownerUid) : null;
             if (result?.error) {
                 const old = this.state.containers?.[key] || null;
-                const failed = containerFromInventory(enrichedInventory, con.uid, key, old, trustedLifecycle);
+                const failed = containerFromInventory(enrichedInventory, con.uid, key, old, ownerUid,
+                                                      trustedLifecycle);
                 failed.healthDetailsLoaded = false;
                 snapshot.push(failed);
                 errors[key] = errorText(result.error);
             } else if (result && !isValidHealthDetails(inventory, result.detail)) {
                 const old = this.state.containers?.[key] || null;
-                const failed = containerFromInventory(enrichedInventory, con.uid, key, old, trustedLifecycle);
+                const failed = containerFromInventory(enrichedInventory, con.uid, key, old, ownerUid,
+                                                      trustedLifecycle);
                 failed.healthDetailsLoaded = false;
                 snapshot.push(failed);
                 errors[key] = CONTAINER_INSPECT_INVALID;
@@ -623,19 +631,21 @@ class Application extends React.Component {
                 const detail = {
                     ...result.detail,
                     uid: con.uid,
+                    ownerUid,
                     key,
                     host: lifecycleHost,
                     context,
                     // Only the verified collector may attach lifecycle
                     // metadata. Podman inspect payloads and labels are not
                     // lifecycle evidence.
-                    LifecycleDisposition: record ? lifecycleMetadataFromRecord(record) : null,
+                    LifecycleDisposition: record ? lifecycleMetadataFromRecord(record, ownerUid) : null,
                 };
                 detail.healthDetailsLoaded = true;
                 snapshot.push(detail);
             } else {
                 const old = this.state.containers?.[key] || null;
-                snapshot.push(containerFromInventory(enrichedInventory, con.uid, key, old, trustedLifecycle));
+                snapshot.push(containerFromInventory(enrichedInventory, con.uid, key, old, ownerUid,
+                                                     trustedLifecycle));
             }
         }
 
@@ -732,10 +742,11 @@ class Application extends React.Component {
         if (!this.isCurrentConnection(con) ||
             (refreshRequest && !this.healthRefreshGate.isCurrent(con.uid, refreshRequest)))
             return false;
+        const ownerUid = this.schedulerUid(con);
         const dispositions = {};
         if (result?.records instanceof Map) {
             result.records.forEach((record, id) => {
-                dispositions[makeKey(con.uid, id)] = lifecycleMetadataFromRecord(record);
+                dispositions[makeKey(con.uid, id)] = lifecycleMetadataFromRecord(record, ownerUid);
             });
         }
         const ownerPrefix = `${con.uid ?? "user"}-`;
@@ -1074,6 +1085,7 @@ class Application extends React.Component {
 
     async collectInitialContainers(con, refreshRequest) {
         const request = this.schedulerRequests.begin(con.uid);
+        const ownerUid = this.schedulerUid(con);
         const deadline = Date.now() + HEALTH_REFRESH_TIMEOUT_MS;
         const initialEventGenerations = new Map();
         const initialEventActions = new Map();
@@ -1149,7 +1161,7 @@ class Application extends React.Component {
                     // source. It supplies lifecycle and identity while the
                     // owner health refresh obtains the optional detail.
                     const current = prevState.containers?.[key] || null;
-                    copyContainers[key] = containerFromInventory(inventory, con.uid, key, current);
+                    copyContainers[key] = containerFromInventory(inventory, con.uid, key, current, ownerUid);
                     if (current && prevState.containerErrors?.[key])
                         copyContainerErrors[key] = prevState.containerErrors[key];
                 }
@@ -1257,6 +1269,7 @@ class Application extends React.Component {
         const schedulerRequest = ["create", "rename", "start"].includes(event?.Action)
             ? this.schedulerRequests.begin(con.uid)
             : null;
+        const ownerUid = this.schedulerUid(con);
         /* when firing off multiple calls in parallel, podman can return them in a random order.
          * This messes up the state. So we need to serialize them for a particular container. */
         const wait = this.pendingUpdateContainer[key] ?? Promise.resolve();
@@ -1284,6 +1297,7 @@ class Application extends React.Component {
                         return;
                     }
                     details.uid = con.uid;
+                    details.ownerUid = ownerUid;
                     details.key = key;
                     const lifecycleDisposition = this.state.lifecycleDispositions?.[key];
                     // Inspect data cannot supply lifecycle evidence. Clear
@@ -1291,7 +1305,7 @@ class Application extends React.Component {
                     // collector record kept in application state.
                     details.LifecycleDisposition = lifecycleDisposition || null;
                     details.host = lifecycleDisposition?.host || null;
-                    details.context = lifecycleDisposition?.context || lifecycleContext(this.schedulerUid(con));
+                    details.context = lifecycleDisposition?.context || lifecycleContext(ownerUid);
                     details.healthDetailsLoaded = true;
                     // HACK: during restart State never changes from "running"
                     //       override it to reconnect console after restart

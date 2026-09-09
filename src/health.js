@@ -69,9 +69,10 @@ const lifecycleIdentityMatches = (container, metadata) => {
     const state = typeof container?.State === "string"
         ? container.State
         : container?.State?.Status || container?.Status || "";
-    if (typeof state !== "string" || state.length === 0)
+    if (typeof container?.ownerUid !== "number" || !Number.isInteger(container.ownerUid) || container.ownerUid < 0 ||
+        typeof state !== "string" || state.length === 0)
         return false;
-    return container?.uid === metadata.uid && container?.host === metadata.host &&
+    return container.ownerUid === metadata.uid && container?.host === metadata.host &&
         container?.context === metadata.context && provenance.kind === "operator-policy" &&
         provenance.source === "source-decisions.json" && provenance.source_ref === LIFECYCLE_POLICY_EVIDENCE_REF &&
         provenance.policy_sha256 === LIFECYCLE_POLICY_SHA256 &&
