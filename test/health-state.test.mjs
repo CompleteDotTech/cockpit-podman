@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { healthAssessment, healthStates, isValidHealthDetails, shouldInspectHealth } from "../src/health.js";
+import { containerDisplayState, healthAssessment, healthStates, isUnconfirmedQuadlet, isValidHealthDetails, shouldInspectHealth } from "../src/health.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixtures = JSON.parse(await readFile(resolve(here, "browser-health-fixtures.json"), "utf8"));
@@ -209,6 +209,37 @@ assert.equal(healthAssessment(explicitStateOneShot, now, null, fixtures.stopped.
 const restartPolicyOnly = structuredClone(exitedSuccessfully);
 restartPolicyOnly.Config.Labels = { "io.kubernetes.container.restartPolicy": "Never" };
 assert.equal(healthAssessment(restartPolicyOnly, now, null, fixtures.stopped.scheduler).status, healthStates.stopped);
+
+// A quadlet row is synthesized from a systemd unit and has no Podman container
+// ID, so its mock "exited" status is not an observed lifecycle. While its owner
+// inventory is unavailable the row must be reported as a collection failure,
+// never as a definitively stopped container.
+const stoppedQuadlet = {
+    IsQuadlet: true,
+    Id: "session-home-complete-tech.service",
+    Name: "session-home-complete-tech",
+    State: { Status: "exited" },
+    Config: { Labels: { PODMAN_SYSTEMD_UNIT: "session-home-complete-tech.service" } },
+};
+assert.equal(isUnconfirmedQuadlet(stoppedQuadlet, "inventory refresh timed out"), true);
+assert.equal(isUnconfirmedQuadlet(stoppedQuadlet, null), false);
+assert.equal(isUnconfirmedQuadlet(exitedSuccessfully, "inventory refresh timed out"), false);
+assert.equal(healthAssessment(stoppedQuadlet, now, null, null).status, healthStates.stopped);
+assert.equal(containerDisplayState(stoppedQuadlet, "inventory refresh timed out"), "unknown");
+assert.equal(containerDisplayState(stoppedQuadlet, null), "exited");
+assert.equal(containerDisplayState(exitedSuccessfully, "inventory refresh timed out"), "exited");
+
+const unavailableQuadlet = healthAssessment(stoppedQuadlet, now, "Container inventory refresh timed out", null);
+assert.notEqual(unavailableQuadlet.status, healthStates.stopped);
+assert.equal(unavailableQuadlet.status, healthStates.error);
+assert.equal(unavailableQuadlet.reason, "collection-timeout");
+assert.equal(unavailableQuadlet.error, "health-collection-timeout");
+const failedQuadlet = healthAssessment(stoppedQuadlet, now, "Container collection is unavailable", null);
+assert.notEqual(failedQuadlet.status, healthStates.stopped);
+assert.equal(failedQuadlet.status, healthStates.error);
+assert.equal(failedQuadlet.reason, "collection-error");
+assert.equal(failedQuadlet.error, "health-collection-failed");
+assert.equal(healthAssessment(stoppedQuadlet, now, null, fixtures.stopped.scheduler).status, healthStates.stopped);
 
 const slowSchedule = { ...fixtures.stale.scheduler, effective_interval_seconds: 180, jitter_seconds: 10, accuracy_seconds: 1 };
 assert.equal(healthAssessment(fixtures.stale.container, now, null, slowSchedule).status, healthStates.healthy);

@@ -11,14 +11,16 @@ import * as utils from './util.js';
 
 const _ = cockpit.gettext;
 
-const render_container_state = (container) => {
+const render_container_state = (container, stateUnavailable = false) => {
     if (container.State.Status === "running") {
         return <><span>{ _("Up since:") } </span><utils.RelativeTime time={container.State.StartedAt} /></>;
     }
+    if (stateUnavailable)
+        return cockpit.format(_("Unavailable"));
     return cockpit.format(_("Exited"));
 };
 
-const ContainerDetails = ({ container }) => {
+const ContainerDetails = ({ container, stateUnavailable = false }) => {
     const networkOptions = (
         [
             container.NetworkSettings?.IPAddress,
@@ -84,7 +86,7 @@ const ContainerDetails = ({ container }) => {
                     }
                     <DescriptionListGroup>
                         <DescriptionListTerm>{_("State")}</DescriptionListTerm>
-                        <DescriptionListDescription>{render_container_state(container)}</DescriptionListDescription>
+                        <DescriptionListDescription>{render_container_state(container, stateUnavailable)}</DescriptionListDescription>
                     </DescriptionListGroup>
                     {container.State?.Checkpointed && <DescriptionListGroup>
                         <DescriptionListTerm>{_("Latest checkpoint")}</DescriptionListTerm>

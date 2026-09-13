@@ -162,6 +162,20 @@ export const isCompletedContainer = container => {
         isTrueMarker(labels["com.docker.compose.oneoff"]);
 };
 
+// A quadlet row is synthesized from a systemd unit and does not carry a
+// Podman container ID.  Its `State.Status` is a display-only mock, so when the
+// owning context's inventory could not be collected the row has no observed
+// lifecycle at all.  Do not let that mock masquerade as a stopped container.
+export const isUnconfirmedQuadlet = (container, collectionError) =>
+    container?.IsQuadlet === true && Boolean(collectionError);
+
+// The state badge consumes this value.  A quadlet whose owner inventory could
+// not be collected must read "unknown" instead of its synthesized "exited".
+export const containerDisplayState = (container, collectionError) =>
+    isUnconfirmedQuadlet(container, collectionError)
+        ? "unknown"
+        : (container?.State?.Status ?? "");
+
 export const observedHealthInterval = state => {
     const logs = (Array.isArray(state?.Log) ? state.Log : [])
             .map(healthLogTime)
@@ -301,7 +315,11 @@ export const healthAssessment = (container, now = Date.now(), collectionError = 
     });
 
     const lifecycle = String(container?.State?.Status || "").toLowerCase();
-    if (lifecycle && lifecycle !== "running") {
+    // A display-only quadlet has no collected lifecycle of its own.  While its
+    // owner inventory is unavailable its synthesized "exited" status is not a
+    // fact, so fall through to the collection failure below and report the row
+    // as unavailable instead of asserting that it is stopped.
+    if (!isUnconfirmedQuadlet(container, collectionError) && lifecycle && lifecycle !== "running") {
         const exitCode = container?.State?.ExitCode;
         const completed = lifecycle === "exited" && (exitCode === 0 || exitCode === "0") &&
             isCompletedContainer(container);
