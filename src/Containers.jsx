@@ -40,7 +40,7 @@ import { PodActions } from './PodActions.jsx';
 import { PodCreateModal } from './PodCreateModal.jsx';
 import PruneUnusedContainersModal from './PruneUnusedContainersModal.jsx';
 import * as client from './client.js';
-import { healthAssessment, healthStates } from './health.js';
+import { containerDisplayState, healthAssessment, healthStates, isUnconfirmedQuadlet } from './health.js';
 import * as utils from './util.js';
 
 import './Containers.scss';
@@ -488,6 +488,11 @@ class Containers extends React.Component {
         const status = container.State?.Status ?? ""; // not-covered: race condition
         const collectionError = this.props.containerErrors?.[container.key] ||
             this.props.contextErrors?.[container.uid] || null;
+        // A synthesized quadlet row has no collected lifecycle of its own. When
+        // its owner inventory is unavailable, its mock "exited" state must not
+        // be rendered as a definitive container state.
+        const stateUnavailable = isUnconfirmedQuadlet(container, collectionError);
+        const displayStatus = containerDisplayState(container, collectionError);
         const scheduler = this.props.schedulerCoverage?.[container.key] || null;
         const assessment = healthAssessment(container, this.state.now, collectionError, scheduler);
 
@@ -538,11 +543,11 @@ class Containers extends React.Component {
             </div>
         );
 
-        let containerStateClass = `ct-badge-container-${status.toLowerCase()}`;
+        let containerStateClass = `ct-badge-container-${displayStatus.toLowerCase()}`;
         if (container.isDownloading)
             containerStateClass += " downloading";
 
-        const containerState = status.charAt(0).toUpperCase() + status.slice(1);
+        const containerState = displayStatus.charAt(0).toUpperCase() + displayStatus.slice(1);
 
         const state = [<Badge key={containerState} isRead className={`${containerStateClass} ct-badge-container-state`}>{_(containerState)}</Badge>]; // States are defined in util.js
         const localizedHealth = localize_health_assessment(assessment);
@@ -598,7 +603,7 @@ class Containers extends React.Component {
             tabs.push({
                 name: _("Details"),
                 renderer: ContainerDetails,
-                data: { container }
+                data: { container, stateUnavailable }
             });
 
             if (!container.isDownloading) {
@@ -665,6 +670,7 @@ class Containers extends React.Component {
                 ...(container.IsQuadlet ? { "data-quadlet-id": container.Id } : { "data-container-id": container.Id }),
                 "data-health-status": assessment.status,
                 "data-health-last-checked": assessment.lastChecked === null ? "" : assessment.lastChecked,
+                "data-state-unavailable": stateUnavailable ? "true" : "false",
                 "data-row-name": `${container.uid === null ? 'user' : container.uid}-${container.Name}`
             },
         };
