@@ -1,3 +1,9 @@
+> **About this fork.** This is a fork of [cockpit-project/cockpit-podman](https://github.com/cockpit-project/cockpit-podman).
+> It adds a container health view: per-owner-context health and freshness, scheduler failures
+> (a read-only helper, `src/health-scheduler.py`, reads systemd schedule metadata), and a fix so a quadlet
+> whose inventory could not be collected is shown as unavailable instead of stopped.
+> The changes come with their own tests under `test/`; everything else is upstream's.
+
 # cockpit-podman
 
 This is the [Cockpit](https://cockpit-project.org/) user interface for [podman
