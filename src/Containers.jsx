@@ -41,6 +41,7 @@ import { PodCreateModal } from './PodCreateModal.jsx';
 import PruneUnusedContainersModal from './PruneUnusedContainersModal.jsx';
 import * as client from './client.js';
 import { healthAssessment, healthStates } from './health.js';
+import { createLocalImagesSelector } from './overview-model.js';
 import * as utils from './util.js';
 
 import './Containers.scss';
@@ -417,6 +418,7 @@ class Containers extends React.Component {
             showPruneUnusedContainersModal: false,
         };
         this.healthTimer = null;
+        this.selectLocalImages = createLocalImagesSelector(utils.image_name);
         this.renderRow = this.renderRow.bind(this);
         this.onWindowResize = this.onWindowResize.bind(this);
         this.podStats = this.podStats.bind(this);

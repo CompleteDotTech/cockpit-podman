@@ -6,6 +6,18 @@
 
 export const schedulerOwnerKey = uid => uid === null ? "user" : String(uid);
 
+// A finite owner budget can end before reaching every eligible container.
+// Rotate a stable full-ID order after the last scheduled row so repeated
+// failures cannot starve either the unresolved tail or already-loaded rows.
+// Comparing IDs also preserves the successor when the cursor is removed.
+export const orderHealthRefresh = (containers, afterId) => {
+    const ordered = [...containers].sort((a, b) => a.Id < b.Id ? -1 : a.Id > b.Id ? 1 : 0);
+    if (!afterId)
+        return ordered;
+    const start = ordered.findIndex(container => container.Id > afterId);
+    return start > 0 ? ordered.slice(start).concat(ordered.slice(0, start)) : ordered;
+};
+
 export class SchedulerRequestGate {
     constructor() {
         this.generations = new Map();

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
-import React, { useContext } from "react";
+import React, { useContext, useMemo } from "react";
 
 import { Tooltip } from "@patternfly/react-core/dist/esm/components/Tooltip";
 import { debounce } from 'throttle-debounce';
@@ -30,8 +30,12 @@ export const PodmanInfoContext = React.createContext<PodmanInfoContextType | nul
 export const usePodmanInfo = () => useContext(PodmanInfoContext);
 
 export const WithPodmanInfo = ({ value, children }: { value: PodmanInfoContextType, children: React.ReactNode }) => {
+    const { cgroupVersion, registries, selinuxAvailable, userPodmanRestartAvailable, userLingeringEnabled, version } = value;
+    const context = useMemo(() => ({
+        cgroupVersion, registries, selinuxAvailable, userPodmanRestartAvailable, userLingeringEnabled, version,
+    }), [cgroupVersion, registries, selinuxAvailable, userPodmanRestartAvailable, userLingeringEnabled, version]);
     return (
-        <PodmanInfoContext.Provider value={value}>
+        <PodmanInfoContext.Provider value={context}>
             {children}
         </PodmanInfoContext.Provider>
     );

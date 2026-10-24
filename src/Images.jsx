@@ -29,12 +29,13 @@ import '@patternfly/react-styles/css/utilities/Sizing/sizing.css';
 
 const _ = cockpit.gettext;
 
-class Images extends React.Component {
+class Images extends React.PureComponent {
     static contextType = DialogsContext;
 
     constructor(props) {
         super(props);
         this.state = {
+            now: Date.now(),
             intermediateOpened: false,
             isExpanded: false,
             // List of container image names which are being downloaded
@@ -44,6 +45,19 @@ class Images extends React.Component {
 
         this.downloadImage = this.downloadImage.bind(this);
         this.renderRow = this.renderRow.bind(this);
+    }
+
+    componentDidMount() {
+        // Creation ages still advance when health/stats updates skip this
+        // table. Opening the section renders the current age immediately.
+        this.ageTimer = window.setInterval(() => {
+            if (this.state.isExpanded)
+                this.setState({ now: Date.now() });
+        }, 60000);
+    }
+
+    componentWillUnmount() {
+        window.clearInterval(this.ageTimer);
     }
 
     downloadImage(imageName, imageTag, con) {

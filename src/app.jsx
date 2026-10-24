@@ -22,12 +22,14 @@ import { superuser } from "superuser";
 import ContainerHeader from './ContainerHeader.tsx';
 import Containers from './Containers.jsx';
 import Images from './Images.jsx';
+import StableDialogs from './StableDialogs.jsx';
 import * as client from './client.js';
 import detect_quadlets from './detect-quadlets.py';
 import scheduler_collector from './health-scheduler.py';
 import { isValidHealthDetails, shouldInspectHealth } from './health.js';
+import { createImageContainerSelector } from './overview-model.js';
 import rest from './rest.js';
-import { KeyedRequestGate, mapWithConcurrency, OwnerRefreshGate, RequestConcurrencyGate, SchedulerRequestGate, withTimeout } from './scheduler-request.js';
+import { KeyedRequestGate, mapWithConcurrency, orderHealthRefresh, OwnerRefreshGate, RequestConcurrencyGate, SchedulerRequestGate, withTimeout } from './scheduler-request.js';
 import { makeKey, WithPodmanInfo, debug } from './util.js';
 
 const _ = cockpit.gettext;
@@ -169,6 +171,8 @@ class Application extends React.Component {
         this.containerEventRequests = new SchedulerRequestGate();
         this.schedulerRequests = new SchedulerRequestGate();
         this.healthRefreshGate = new OwnerRefreshGate();
+        this.healthInspectCursors = new Map();
+        this.selectImageContainers = createImageContainerSelector();
         // A timer tick that lands during a running refresh must result in one
         // follow-up pass. OwnerRefreshGate coalesces that tick by design, so
         // retain the request here instead of allowing a slow owner to miss a
@@ -278,6 +282,7 @@ class Application extends React.Component {
             return false;
         this.healthRefreshFollowups.delete(uid === null ? "user" : String(uid));
         this.healthRefreshGate.invalidate(uid);
+        this.healthInspectCursors.delete(uid);
         this.schedulerRequests.begin(uid);
         const ownerPrefix = `${uid ?? "user"}-`;
         for (const key of this.containerEventGenerations.keys()) {
@@ -439,16 +444,21 @@ class Application extends React.Component {
         // details are pending or configured; rows already known to have no
         // check, and every stopped/completed row, can be rendered without
         // another expensive request.
-        const inspectList = validInventory.filter(container => {
+        const inspectList = orderHealthRefresh(validInventory.filter(container => {
             const key = makeKey(con.uid, container.Id);
             return shouldInspectHealth(container, this.state.containers?.[key]);
-        });
+        }), this.healthInspectCursors.get(con.uid));
         const results = await mapWithConcurrency(inspectList, async container => {
             if (!isContainerInventoryRow(container))
                 return { container, error: new Error("Container inventory row is invalid") };
             const remaining = Math.min(HEALTH_INSPECT_TIMEOUT_MS, refreshDeadline - Date.now());
             if (remaining <= 0)
                 return { container, error: new Error("Container health refresh timed out") };
+            if (!this.isCurrentConnection(con) || !this.healthRefreshGate.isCurrent(con.uid, request))
+                return { container, error: new Error("Container health refresh superseded") };
+            // Advance only for scheduled work, so the next bounded owner pass
+            // reaches the unattempted tail before repeating this prefix.
+            this.healthInspectCursors.set(con.uid, container.Id);
             try {
                 const inspectRequest = this.inspectContainer(con, container.Id);
                 const detail = await this.withContainerRequestTimeout(inspectRequest, remaining,
